@@ -35,3 +35,35 @@ class PromptRewriteModelSettings:
             openrouter_api_key=api_key,
             openrouter_base_url=base_url.rstrip("/"),
         )
+
+
+@dataclass(frozen=True)
+class ImageGenerationModelSettings:
+    image_model: str
+    openrouter_api_key: str
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
+    @classmethod
+    def from_env(cls) -> "ImageGenerationModelSettings":
+        load_dotenv(override=False)
+        image_model = os.getenv("IMAGE_MODEL", "").strip()
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        base_url = os.getenv("OPENROUTER_BASE_URL", "").strip() or "https://openrouter.ai/api/v1"
+
+        missing: list[str] = []
+        if not image_model:
+            missing.append("IMAGE_MODEL")
+        if not api_key:
+            missing.append("OPENROUTER_API_KEY")
+
+        if missing:
+            missing_joined = ", ".join(missing)
+            raise ValueError(
+                f"Missing required environment variables for image generation: {missing_joined}"
+            )
+
+        return cls(
+            image_model=image_model,
+            openrouter_api_key=api_key,
+            openrouter_base_url=base_url.rstrip("/"),
+        )

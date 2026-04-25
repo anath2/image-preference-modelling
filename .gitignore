@@ -209,6 +209,9 @@ __marimo__/
 # Roadmap doc
 docs/roadmap.md
 
+# Persisted local prompt-source cache
+data/prompt_sources/
+
 # Local git worktrees
 .worktrees/
 

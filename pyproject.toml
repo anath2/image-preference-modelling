@@ -11,6 +11,7 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.128.8",
     "gradio>=5.49.1",
+    "pyarrow>=24.0.0",
     "python-dotenv>=1.1.1",
     "requests>=2.32.5",
 ]

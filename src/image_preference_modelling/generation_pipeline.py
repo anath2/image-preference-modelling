@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
+import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
-from dotenv import load_dotenv
+
+from image_preference_modelling.config import ImageGenerationModelSettings
 
 
 class PromptSourceClientError(RuntimeError):
@@ -23,56 +25,15 @@ class GenerationDryRunOutputError(ValueError):
     """Raised when an external response is missing required fields."""
 
 
-@dataclass(frozen=True)
-class GenerationDryRunSettings:
-    openrouter_api_key: str
-    openrouter_image_model: str = "google/gemini-2.5-flash-image"
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    hf_prompt_dataset: str = "daspartho/stable-diffusion-prompts"
-    hf_prompt_config: str = "default"
-    hf_prompt_split: str = "train"
-    hf_prompt_column: str = "prompt"
-    timeout_seconds: float = 60.0
+DEFAULT_HF_PROMPT_DATASET = "succinctly/midjourney-prompts"
+DEFAULT_HF_PROMPT_CONFIG = "default"
+DEFAULT_HF_PROMPT_SPLIT = "train"
+DEFAULT_HF_PROMPT_COLUMN = "text"
+DEFAULT_PROMPT_SOURCE_ROOT = Path("data/prompt_sources")
+DEFAULT_PROMPT_CANDIDATE_COUNT = 20
+DEFAULT_TIMEOUT_SECONDS = 60.0
+_ALPHA_TOKEN_PATTERN = re.compile(r"[A-Za-z]{2,}")
 
-    @classmethod
-    def from_env(cls) -> "GenerationDryRunSettings":
-        # Load local .env for developer runs without overriding exported env vars.
-        load_dotenv(override=False)
-
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        image_model = os.getenv("OPENROUTER_IMAGE_MODEL", "").strip() or "google/gemini-2.5-flash-image"
-        base_url = os.getenv("OPENROUTER_BASE_URL", "").strip() or "https://openrouter.ai/api/v1"
-        hf_prompt_dataset = os.getenv("HF_PROMPT_DATASET", "").strip() or "daspartho/stable-diffusion-prompts"
-        hf_prompt_config = os.getenv("HF_PROMPT_CONFIG", "").strip() or "default"
-        hf_prompt_split = os.getenv("HF_PROMPT_SPLIT", "").strip() or "train"
-        hf_prompt_column = os.getenv("HF_PROMPT_COLUMN", "").strip() or "prompt"
-        timeout_raw = os.getenv("GENERATION_DRY_RUN_TIMEOUT_SECONDS", "").strip()
-
-        missing: list[str] = []
-        if not api_key:
-            missing.append("OPENROUTER_API_KEY")
-
-        if missing:
-            missing_joined = ", ".join(missing)
-            raise ValueError(f"Missing required environment variables for generation dry run: {missing_joined}")
-
-        timeout_seconds = 60.0
-        if timeout_raw:
-            try:
-                timeout_seconds = float(timeout_raw)
-            except ValueError as exc:
-                raise ValueError("GENERATION_DRY_RUN_TIMEOUT_SECONDS must be a float") from exc
-
-        return cls(
-            openrouter_api_key=api_key,
-            openrouter_image_model=image_model,
-            openrouter_base_url=base_url.rstrip("/"),
-            hf_prompt_dataset=hf_prompt_dataset,
-            hf_prompt_config=hf_prompt_config,
-            hf_prompt_split=hf_prompt_split,
-            hf_prompt_column=hf_prompt_column,
-            timeout_seconds=timeout_seconds,
-        )
 
 
 @dataclass(frozen=True)
@@ -81,33 +42,145 @@ class GenerationDryRunResult:
     image_path: Path
 
 
-def sample_prompt_from_huggingface(settings: GenerationDryRunSettings) -> str:
+def ensure_prompt_source_parquet(
+    *,
+    dataset: str = DEFAULT_HF_PROMPT_DATASET,
+    config: str = DEFAULT_HF_PROMPT_CONFIG,
+    split: str = DEFAULT_HF_PROMPT_SPLIT,
+    prompt_column: str = DEFAULT_HF_PROMPT_COLUMN,
+    prompt_source_root: Path = DEFAULT_PROMPT_SOURCE_ROOT,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Path:
+    parquet_path = prompt_source_root / _prompt_dataset_dirname(dataset) / config / f"{split}.parquet"
+    if parquet_path.exists():
+        try:
+            _validate_prompt_source_parquet(parquet_path, prompt_column=prompt_column)
+            return parquet_path
+        except GenerationDryRunOutputError:
+            parquet_path.unlink(missing_ok=True)
+
+    parquet_url = _discover_prompt_source_parquet_url(
+        dataset=dataset,
+        config=config,
+        split=split,
+        timeout_seconds=timeout_seconds,
+    )
+
+    try:
+        response = requests.get(parquet_url, timeout=timeout_seconds)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise PromptSourceClientError(f"Prompt source parquet download failed: {exc}") from exc
+
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = parquet_path.with_name(f".{parquet_path.name}.tmp")
+    temp_path.write_bytes(response.content)
+    try:
+        _validate_prompt_source_parquet(temp_path, prompt_column=prompt_column)
+    except GenerationDryRunOutputError:
+        temp_path.unlink(missing_ok=True)
+        raise
+    temp_path.replace(parquet_path)
+    return parquet_path
+
+
+def read_prompts_from_parquet(parquet_path: Path, *, prompt_column: str = DEFAULT_HF_PROMPT_COLUMN) -> list[str]:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    try:
+        table = pq.read_table(parquet_path, columns=[prompt_column])
+        column = table.column(prompt_column).to_pylist()
+    except (KeyError, OSError, pa.ArrowException) as exc:
+        raise GenerationDryRunOutputError(
+            f"Could not read prompt source parquet `{parquet_path}`"
+        ) from exc
+    return [prompt for prompt in column if isinstance(prompt, str)]
+
+
+def sample_prompts_from_local_source(
+    *,
+    prompt_source_root: Path = DEFAULT_PROMPT_SOURCE_ROOT,
+    candidate_count: int = DEFAULT_PROMPT_CANDIDATE_COUNT,
+    dataset: str = DEFAULT_HF_PROMPT_DATASET,
+    config: str = DEFAULT_HF_PROMPT_CONFIG,
+    split: str = DEFAULT_HF_PROMPT_SPLIT,
+    prompt_column: str = DEFAULT_HF_PROMPT_COLUMN,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> list[str]:
+    parquet_path = ensure_prompt_source_parquet(
+        dataset=dataset,
+        config=config,
+        split=split,
+        prompt_column=prompt_column,
+        prompt_source_root=prompt_source_root,
+        timeout_seconds=timeout_seconds,
+    )
+    prompts = [
+        prompt
+        for prompt in read_prompts_from_parquet(parquet_path, prompt_column=prompt_column)
+        if _is_usable_prompt(prompt)
+    ]
+    if not prompts:
+        raise GenerationDryRunOutputError("Prompt source parquet did not contain usable prompts")
+    if len(prompts) <= candidate_count:
+        return prompts
+    return random.sample(prompts, k=candidate_count)
+
+
+def _discover_prompt_source_parquet_url(
+    *,
+    dataset: str,
+    config: str,
+    split: str,
+    timeout_seconds: float,
+) -> str:
     try:
         response = requests.get(
-            "https://datasets-server.huggingface.co/first-rows",
-            params={
-                "dataset": settings.hf_prompt_dataset,
-                "config": settings.hf_prompt_config,
-                "split": settings.hf_prompt_split,
-            },
-            timeout=settings.timeout_seconds,
+            "https://datasets-server.huggingface.co/parquet",
+            params={"dataset": dataset},
+            timeout=timeout_seconds,
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise PromptSourceClientError(f"Prompt source request failed: {exc}") from exc
+        raise PromptSourceClientError(f"Prompt source metadata request failed: {exc}") from exc
 
-    return _extract_prompt(response.json(), prompt_column=settings.hf_prompt_column)
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise GenerationDryRunOutputError("Prompt source metadata response was malformed")
+
+    parquet_files = payload.get("parquet_files")
+    if not isinstance(parquet_files, list):
+        raise GenerationDryRunOutputError("Prompt source metadata missing parquet_files")
+
+    for parquet_file in parquet_files:
+        if not isinstance(parquet_file, dict):
+            continue
+        if parquet_file.get("config") != config or parquet_file.get("split") != split:
+            continue
+        parquet_url = parquet_file.get("url")
+        if isinstance(parquet_url, str) and parquet_url:
+            return parquet_url
+
+    raise GenerationDryRunOutputError(
+        f"Prompt source metadata did not contain parquet for config={config!r} split={split!r}"
+    )
 
 
-def generate_image_from_openrouter(prompt: str, settings: GenerationDryRunSettings) -> str:
+def generate_image_from_openrouter(
+    prompt: str,
+    settings: ImageGenerationModelSettings,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> str:
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": settings.openrouter_image_model,
+        "model": settings.image_model,
         "messages": [{"role": "user", "content": prompt}],
-        "modalities": ["image", "text"],
+        "modalities": ["image"],
     }
 
     try:
@@ -115,7 +188,7 @@ def generate_image_from_openrouter(prompt: str, settings: GenerationDryRunSettin
             f"{settings.openrouter_base_url}/chat/completions",
             json=payload,
             headers=headers,
-            timeout=settings.timeout_seconds,
+            timeout=timeout_seconds,
         )
         response.raise_for_status()
     except requests.RequestException as exc:
@@ -135,13 +208,32 @@ def save_generated_image(data_url: str, output_dir: Path) -> Path:
 def run_generation_dry_run(
     output_dir: Path,
     *,
-    settings: GenerationDryRunSettings | None = None,
+    settings: ImageGenerationModelSettings | None = None,
 ) -> GenerationDryRunResult:
-    active_settings = settings or GenerationDryRunSettings.from_env()
-    prompt = sample_prompt_from_huggingface(active_settings)
-    image_data_url = generate_image_from_openrouter(prompt, active_settings)
-    image_path = save_generated_image(image_data_url, output_dir)
-    return GenerationDryRunResult(prompt=prompt, image_path=image_path)
+    active_settings = settings or ImageGenerationModelSettings.from_env()
+    prompts = sample_prompts_from_local_source(
+        prompt_source_root=DEFAULT_PROMPT_SOURCE_ROOT,
+        candidate_count=DEFAULT_PROMPT_CANDIDATE_COUNT,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    )
+    last_failure: ImageGenerationClientError | GenerationDryRunOutputError | None = None
+
+    for prompt in prompts:
+        try:
+            image_data_url = generate_image_from_openrouter(
+                prompt,
+                active_settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            )
+            image_path = save_generated_image(image_data_url, output_dir)
+            return GenerationDryRunResult(prompt=prompt, image_path=image_path)
+        except (ImageGenerationClientError, GenerationDryRunOutputError) as exc:
+            last_failure = exc
+
+    if last_failure is not None:
+        raise last_failure
+
+    raise GenerationDryRunOutputError("Prompt source did not return any candidate prompts")
 
 
 def _extract_prompt(payload: dict[str, Any], *, prompt_column: str) -> str:
@@ -162,6 +254,24 @@ def _extract_prompt(payload: dict[str, Any], *, prompt_column: str) -> str:
     raise GenerationDryRunOutputError(
         f"Prompt source response did not contain a non-empty `{prompt_column}` value"
     )
+
+
+def _prompt_dataset_dirname(dataset: str) -> str:
+    return dataset.replace("/", "_")
+
+
+def _validate_prompt_source_parquet(
+    parquet_path: Path,
+    *,
+    prompt_column: str,
+) -> None:
+    read_prompts_from_parquet(parquet_path, prompt_column=prompt_column)
+
+
+def _is_usable_prompt(prompt: str) -> bool:
+    stripped_prompt = prompt.strip()
+    alpha_tokens = _ALPHA_TOKEN_PATTERN.findall(stripped_prompt)
+    return len(stripped_prompt) >= 40 and len(alpha_tokens) >= 5
 
 
 def _extract_image_data_url(payload: dict[str, Any]) -> str:
