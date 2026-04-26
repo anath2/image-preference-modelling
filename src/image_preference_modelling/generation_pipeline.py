@@ -6,19 +6,10 @@ import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import requests
 
 from image_preference_modelling.config import ImageGenerationModelSettings
-
-
-class PromptSourceClientError(RuntimeError):
-    """Raised when the prompt source request fails."""
-
-
-class ImageGenerationClientError(RuntimeError):
-    """Raised when the image generation request fails."""
 
 
 class GenerationDryRunOutputError(ValueError):
@@ -47,17 +38,12 @@ def ensure_prompt_source_parquet(
     dataset: str = DEFAULT_HF_PROMPT_DATASET,
     config: str = DEFAULT_HF_PROMPT_CONFIG,
     split: str = DEFAULT_HF_PROMPT_SPLIT,
-    prompt_column: str = DEFAULT_HF_PROMPT_COLUMN,
     prompt_source_root: Path = DEFAULT_PROMPT_SOURCE_ROOT,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Path:
     parquet_path = prompt_source_root / _prompt_dataset_dirname(dataset) / config / f"{split}.parquet"
     if parquet_path.exists():
-        try:
-            _validate_prompt_source_parquet(parquet_path, prompt_column=prompt_column)
-            return parquet_path
-        except GenerationDryRunOutputError:
-            parquet_path.unlink(missing_ok=True)
+        return parquet_path
 
     parquet_url = _discover_prompt_source_parquet_url(
         dataset=dataset,
@@ -66,35 +52,19 @@ def ensure_prompt_source_parquet(
         timeout_seconds=timeout_seconds,
     )
 
-    try:
-        response = requests.get(parquet_url, timeout=timeout_seconds)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise PromptSourceClientError(f"Prompt source parquet download failed: {exc}") from exc
+    response = requests.get(parquet_url, timeout=timeout_seconds)
+    response.raise_for_status()
 
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = parquet_path.with_name(f".{parquet_path.name}.tmp")
-    temp_path.write_bytes(response.content)
-    try:
-        _validate_prompt_source_parquet(temp_path, prompt_column=prompt_column)
-    except GenerationDryRunOutputError:
-        temp_path.unlink(missing_ok=True)
-        raise
-    temp_path.replace(parquet_path)
+    parquet_path.write_bytes(response.content)
     return parquet_path
 
 
 def read_prompts_from_parquet(parquet_path: Path, *, prompt_column: str = DEFAULT_HF_PROMPT_COLUMN) -> list[str]:
-    import pyarrow as pa
     import pyarrow.parquet as pq
 
-    try:
-        table = pq.read_table(parquet_path, columns=[prompt_column])
-        column = table.column(prompt_column).to_pylist()
-    except (KeyError, OSError, pa.ArrowException) as exc:
-        raise GenerationDryRunOutputError(
-            f"Could not read prompt source parquet `{parquet_path}`"
-        ) from exc
+    table = pq.read_table(parquet_path, columns=[prompt_column])
+    column = table.column(prompt_column).to_pylist()
     return [prompt for prompt in column if isinstance(prompt, str)]
 
 
@@ -112,7 +82,6 @@ def sample_prompts_from_local_source(
         dataset=dataset,
         config=config,
         split=split,
-        prompt_column=prompt_column,
         prompt_source_root=prompt_source_root,
         timeout_seconds=timeout_seconds,
     )
@@ -135,36 +104,20 @@ def _discover_prompt_source_parquet_url(
     split: str,
     timeout_seconds: float,
 ) -> str:
-    try:
-        response = requests.get(
-            "https://datasets-server.huggingface.co/parquet",
-            params={"dataset": dataset},
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise PromptSourceClientError(f"Prompt source metadata request failed: {exc}") from exc
+    response = requests.get(
+        "https://datasets-server.huggingface.co/parquet",
+        params={"dataset": dataset},
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
 
     payload = response.json()
-    if not isinstance(payload, dict):
-        raise GenerationDryRunOutputError("Prompt source metadata response was malformed")
-
-    parquet_files = payload.get("parquet_files")
-    if not isinstance(parquet_files, list):
-        raise GenerationDryRunOutputError("Prompt source metadata missing parquet_files")
-
-    for parquet_file in parquet_files:
-        if not isinstance(parquet_file, dict):
-            continue
+    for parquet_file in payload["parquet_files"]:
         if parquet_file.get("config") != config or parquet_file.get("split") != split:
             continue
-        parquet_url = parquet_file.get("url")
-        if isinstance(parquet_url, str) and parquet_url:
-            return parquet_url
+        return parquet_file["url"]
 
-    raise GenerationDryRunOutputError(
-        f"Prompt source metadata did not contain parquet for config={config!r} split={split!r}"
-    )
+    raise LookupError(f"Prompt source has no parquet for config={config!r} split={split!r}")
 
 
 def generate_image_from_openrouter(
@@ -183,16 +136,13 @@ def generate_image_from_openrouter(
         "modalities": ["image"],
     }
 
-    try:
-        response = requests.post(
-            f"{settings.openrouter_base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise ImageGenerationClientError(f"Image generation request failed: {exc}") from exc
+    response = requests.post(
+        f"{settings.openrouter_base_url}/chat/completions",
+        json=payload,
+        headers=headers,
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
 
     return _extract_image_data_url(response.json())
 
@@ -216,7 +166,7 @@ def run_generation_dry_run(
         candidate_count=DEFAULT_PROMPT_CANDIDATE_COUNT,
         timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     )
-    last_failure: ImageGenerationClientError | GenerationDryRunOutputError | None = None
+    last_failure: GenerationDryRunOutputError | None = None
 
     for prompt in prompts:
         try:
@@ -227,7 +177,7 @@ def run_generation_dry_run(
             )
             image_path = save_generated_image(image_data_url, output_dir)
             return GenerationDryRunResult(prompt=prompt, image_path=image_path)
-        except (ImageGenerationClientError, GenerationDryRunOutputError) as exc:
+        except GenerationDryRunOutputError as exc:
             last_failure = exc
 
     if last_failure is not None:
@@ -236,36 +186,8 @@ def run_generation_dry_run(
     raise GenerationDryRunOutputError("Prompt source did not return any candidate prompts")
 
 
-def _extract_prompt(payload: dict[str, Any], *, prompt_column: str) -> str:
-    rows = payload.get("rows")
-    if not isinstance(rows, list) or not rows:
-        raise GenerationDryRunOutputError("Prompt source response missing rows")
-
-    for item in rows:
-        if not isinstance(item, dict):
-            continue
-        row = item.get("row")
-        if not isinstance(row, dict):
-            continue
-        prompt = row.get(prompt_column)
-        if isinstance(prompt, str) and prompt.strip():
-            return prompt.strip()
-
-    raise GenerationDryRunOutputError(
-        f"Prompt source response did not contain a non-empty `{prompt_column}` value"
-    )
-
-
 def _prompt_dataset_dirname(dataset: str) -> str:
     return dataset.replace("/", "_")
-
-
-def _validate_prompt_source_parquet(
-    parquet_path: Path,
-    *,
-    prompt_column: str,
-) -> None:
-    read_prompts_from_parquet(parquet_path, prompt_column=prompt_column)
 
 
 def _is_usable_prompt(prompt: str) -> bool:
@@ -274,28 +196,12 @@ def _is_usable_prompt(prompt: str) -> bool:
     return len(stripped_prompt) >= 40 and len(alpha_tokens) >= 5
 
 
-def _extract_image_data_url(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise GenerationDryRunOutputError("OpenRouter response missing choices")
+def _extract_image_data_url(payload: dict) -> str:
+    try:
+        data_url = payload["choices"][0]["message"]["images"][0]["image_url"]["url"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise GenerationDryRunOutputError("OpenRouter response missing image data URL") from exc
 
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        raise GenerationDryRunOutputError("OpenRouter response missing message")
-
-    images = message.get("images")
-    if not isinstance(images, list) or not images:
-        raise GenerationDryRunOutputError("OpenRouter response missing images")
-
-    image = images[0]
-    if not isinstance(image, dict):
-        raise GenerationDryRunOutputError("OpenRouter response image payload is malformed")
-
-    image_url = image.get("image_url")
-    if not isinstance(image_url, dict):
-        raise GenerationDryRunOutputError("OpenRouter response missing image_url payload")
-
-    data_url = image_url.get("url")
     if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
         raise GenerationDryRunOutputError("OpenRouter response missing image data URL")
 

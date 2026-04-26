@@ -215,3 +215,11 @@ data/prompt_sources/
 # Local git worktrees
 .worktrees/
 
+#data
+data/
+
+#misc
+.DS_Store
+ 
+#local
+.local/

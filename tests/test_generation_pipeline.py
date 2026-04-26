@@ -112,65 +112,6 @@ def test_ensure_prompt_source_parquet_reuses_valid_cached_file_without_refetchin
     assert generation_pipeline.ensure_prompt_source_parquet(prompt_source_root=prompt_source_root) == parquet_path
 
 
-def test_invalid_cached_parquet_is_replaced_from_prompt_source(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    prompt_source_root = tmp_path / "data" / "prompt_sources"
-    parquet_path = _cached_prompt_path(prompt_source_root)
-    parquet_path.parent.mkdir(parents=True)
-    parquet_path.write_bytes(b"not parquet")
-    replacement_bytes = _prompt_parquet_bytes(
-        ["A cinematic botanical observatory glowing in moonlight with ornate glass panels"]
-    )
-    calls: list[str] = []
-
-    def _fake_get(
-        url: str,
-        *,
-        params: dict[str, str] | None = None,
-        timeout: float,
-    ) -> _FakeResponse:
-        calls.append(url)
-        if url == "https://datasets-server.huggingface.co/parquet":
-            return _FakeResponse(
-                json_payload={
-                    "parquet_files": [
-                        {
-                            "config": "default",
-                            "split": "train",
-                            "url": "https://example.test/train.parquet",
-                        }
-                    ]
-                }
-            )
-        return _FakeResponse(content=replacement_bytes)
-
-    monkeypatch.setattr(generation_pipeline.requests, "get", _fake_get)
-
-    sampled_prompts = generation_pipeline.sample_prompts_from_local_source(
-        prompt_source_root=prompt_source_root,
-        candidate_count=10,
-    )
-
-    assert sampled_prompts == [
-        "A cinematic botanical observatory glowing in moonlight with ornate glass panels"
-    ]
-    assert parquet_path.read_bytes() == replacement_bytes
-    assert calls == [
-        "https://datasets-server.huggingface.co/parquet",
-        "https://example.test/train.parquet",
-    ]
-
-
-def test_read_prompts_from_parquet_wraps_invalid_parquet_errors(tmp_path: Path) -> None:
-    invalid_path = tmp_path / "invalid.parquet"
-    invalid_path.write_bytes(b"not parquet")
-
-    with pytest.raises(GenerationDryRunOutputError, match="Could not read prompt source parquet"):
-        generation_pipeline.read_prompts_from_parquet(invalid_path)
-
-
 def test_sample_prompts_from_local_source_filters_and_samples_local_candidates(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
