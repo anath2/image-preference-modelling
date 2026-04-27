@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from time import sleep
 
@@ -69,7 +70,7 @@ def test_dispatch_run_failure_path_sets_failed_and_logs(tmp_path: Path) -> None:
     launcher.dispatch_run(run_id)
     run = _wait_for_terminal_state(store, run_id)
     assert run["status"] == "failed"
-    log_text = (Path(run["artifact_dir"]) / "job.log").read_text(encoding="utf-8")
+    log_text = _wait_for_log_file(run).read_text(encoding="utf-8")
     assert "forced failure" in log_text
 
 
@@ -88,3 +89,55 @@ def test_cancel_running_run_transitions_to_cancelled(tmp_path: Path) -> None:
 
     run = _wait_for_terminal_state(store, run_id)
     assert run["status"] == "cancelled"
+
+
+def test_gepa_run_config_preserves_job_id_and_minibatch_size(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    launcher = JobLauncher(state_store=store)
+    job_id = store.create_aesthetic_job(
+        name="launcher-job",
+        description="job for launcher test",
+        seed_refinement_prompt="Preserve intent while improving style.",
+    )
+    session_id = store.create_rating_session(name="launcher-session")
+    rollout_id = store.create_rollout(
+        job_id=job_id,
+        prompt_text="city at dusk",
+        intent_text="city at dusk",
+        baseline_image_uri="baseline.png",
+        refined_image_uri="refined.png",
+        candidate_id=None,
+        refinement_prompt="Improve color depth.",
+        model_config={"image_model": "test-model"},
+    )
+    comparison_id = store.add_comparison(
+        session_id=session_id,
+        prompt_text="city at dusk",
+        left_image_uri="baseline.png",
+        right_image_uri="refined.png",
+        winner="right",
+        critique="Refined output has stronger contrast and detail.",
+        outcome="winner",
+    )
+    store.mark_rollout_feedback_complete(rollout_id, comparison_id)
+
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA optimization",
+        config={
+            "job_id": job_id,
+            "minibatch_size": 1,
+            "selected_rollout_ids": [rollout_id],
+            "optimizer_backend": "heuristic_fallback",
+        },
+    )
+
+    launcher.dispatch_run(run_id)
+    run = _wait_for_terminal_state(store, run_id)
+    assert run["status"] == "completed"
+
+    config = json.loads((Path(run["artifact_dir"]) / "config.json").read_text(encoding="utf-8"))
+    assert config["job_id"] == job_id
+    assert config["minibatch_size"] == 1
+    checkpoint_path = Path(run["artifact_dir"]) / "checkpoint.json"
+    assert checkpoint_path.exists()

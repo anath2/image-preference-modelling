@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 2
+    assert store.schema_version() == 4
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -244,3 +244,121 @@ def test_integrity_report_detects_bad_rows(tmp_path: Path) -> None:
     assert any("running status without started_at" in msg for msg in issues["invalid_status_transitions"])
     assert any("missing artifact directory" in msg for msg in issues["dangling_artifacts"])
     assert any("missing rating_session" in msg for msg in issues["invalid_comparisons"])
+
+
+def test_aesthetic_job_crud_and_policy_update(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="cinematic-neon",
+        description="Neon cinematic mood with preserved composition",
+        seed_refinement_prompt="Improve lighting and texture while preserving composition.",
+    )
+
+    listed = store.list_aesthetic_jobs()
+    assert len(listed) == 1
+    assert listed[0]["id"] == job_id
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    assert job["status"] == "active"
+
+    store.update_aesthetic_job_policy(
+        job_id, active_candidate_id="candidate_001", compiled_gepa_prompt="Prefer richer neon contrast."
+    )
+    updated = store.get_aesthetic_job(job_id)
+    assert updated is not None
+    assert updated["active_candidate_id"] == "candidate_001"
+    assert updated["compiled_gepa_prompt"] == "Prefer richer neon contrast."
+
+
+def test_create_rollout_and_mark_feedback_complete(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="portrait-polish",
+        description="Polish portrait tone and detail",
+        seed_refinement_prompt="Improve facial detail while preserving identity.",
+    )
+    session_id = store.create_rating_session(name="session")
+    rollout_id = store.create_rollout(
+        job_id=job_id,
+        prompt_text="portrait in golden hour",
+        intent_text="portrait in warm natural light",
+        baseline_image_uri="baseline.png",
+        refined_image_uri="refined.png",
+        candidate_id=None,
+        refinement_prompt="Enhance natural warm tones.",
+        model_config={"model": "image-model-a"},
+    )
+
+    comparison_id = store.add_comparison(
+        session_id=session_id,
+        prompt_text="portrait in golden hour",
+        left_image_uri="baseline.png",
+        right_image_uri="refined.png",
+        winner="right",
+        critique="Refined image has better skin tone and lighting consistency.",
+        outcome="winner",
+    )
+    store.mark_rollout_feedback_complete(rollout_id, comparison_id)
+
+    completed = store.list_completed_rollouts_for_job(job_id)
+    assert len(completed) == 1
+    assert completed[0]["id"] == rollout_id
+    assert completed[0]["status"] == "feedback_complete"
+    assert completed[0]["comparison_id"] == comparison_id
+    assert store.count_completed_rollouts_for_job(job_id) == 1
+    assert store.list_completed_rollout_ids_for_job(job_id, limit=3) == [rollout_id]
+
+
+def test_add_comparison_requires_non_empty_critique(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    session_id = store.create_rating_session(name="strict-feedback")
+
+    with pytest.raises(ValueError, match="critique cannot be empty"):
+        store.add_comparison(
+            session_id=session_id,
+            prompt_text="prompt",
+            left_image_uri="left.png",
+            right_image_uri="right.png",
+            winner="left",
+            critique="   ",
+            outcome="winner",
+        )
+
+
+def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="mood-noir",
+        description="Noir mood enhancement",
+        seed_refinement_prompt="Increase contrast while preserving scene composition.",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA seed run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+
+    candidate_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="Candidate policy text",
+        compiled_prompt="Use moody shadows and controlled highlights.",
+        objective_scores={"preference_win": 0.8, "feedback_quality": 0.9},
+        created_by_run_id=run_id,
+    )
+    candidates = store.list_gepa_candidates_for_job(job_id)
+    assert len(candidates) == 1
+    assert candidates[0]["id"] == candidate_id
+    assert candidates[0]["parent_candidate_ids"] == []
+    assert candidates[0]["objective_scores"]["preference_win"] == 0.8
+    assert candidates[0]["frontier_member"] is False
+
+    store.set_candidate_frontier_membership(candidate_id, True)
+    updated_candidates = store.list_gepa_candidates_for_job(job_id)
+    assert updated_candidates[0]["frontier_member"] is True
+
+    store.promote_job_candidate(job_id, candidate_id)
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    assert job["active_candidate_id"] == candidate_id
+    assert job["compiled_gepa_prompt"] == "Use moody shadows and controlled highlights."

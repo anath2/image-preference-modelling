@@ -6,6 +6,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
+from image_preference_modelling.gepa.optimizer import run_gepa_optimization
 from image_preference_modelling.storage.state_store import StateStore
 
 
@@ -69,6 +70,21 @@ class JobLauncher:
             config = json.loads((Path(run["artifact_dir"]) / "config.json").read_text(encoding="utf-8"))
             if config.get("force_fail"):
                 raise RuntimeError("forced failure requested by run config")
+
+            if run["run_type"] == "gepa":
+                run_gepa_optimization(
+                    run_id=run_id,
+                    artifact_dir=Path(run["artifact_dir"]),
+                    state_store=self.state_store,
+                    config=config,
+                    append_event=lambda level, message: self.state_store.append_run_event(
+                        run_id, level, message
+                    ),
+                    is_cancel_requested=lambda: self._is_cancel_requested(run_id),
+                )
+                self.state_store.update_run_status(run_id, "completed")
+                self.state_store.append_run_event(run_id, "INFO", "Worker completed successfully.")
+                return
 
             steps = max(1, int(config.get("simulated_steps", 3)))
             sleep_seconds = float(config.get("simulated_step_seconds", 0.02))

@@ -24,13 +24,29 @@ DEFAULT_PROMPT_SOURCE_ROOT = Path("data/prompt_sources")
 DEFAULT_PROMPT_CANDIDATE_COUNT = 20
 DEFAULT_TIMEOUT_SECONDS = 60.0
 _ALPHA_TOKEN_PATTERN = re.compile(r"[A-Za-z]{2,}")
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+_IMAGE_SUFFIX_BY_MIME = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
 
 
 
 @dataclass(frozen=True)
 class GenerationDryRunResult:
     prompt: str
+    baseline_image_path: Path
+    refined_image_path: Path
+    # Compatibility alias for legacy callers expecting a single output image.
     image_path: Path
+    used_image_conditioning: bool
 
 
 def ensure_prompt_source_parquet(
@@ -126,13 +142,48 @@ def generate_image_from_openrouter(
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
+    return _post_openrouter_image_completion(
+        settings=settings,
+        messages=[{"role": "user", "content": prompt}],
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def generate_image_refinement_from_openrouter(
+    prompt: str,
+    source_image_data_url: str,
+    settings: ImageGenerationModelSettings,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> str:
+    return _post_openrouter_image_completion(
+        settings=settings,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": source_image_data_url}},
+                ],
+            }
+        ],
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _post_openrouter_image_completion(
+    *,
+    settings: ImageGenerationModelSettings,
+    messages: list[dict[str, object]],
+    timeout_seconds: float,
+) -> str:
     headers = {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
     }
     payload = {
         "model": settings.image_model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "modalities": ["image"],
     }
 
@@ -147,12 +198,22 @@ def generate_image_from_openrouter(
     return _extract_image_data_url(response.json())
 
 
-def save_generated_image(data_url: str, output_dir: Path) -> Path:
+def save_generated_image(data_url: str, output_dir: Path, *, stem: str = "online-dry-run") -> Path:
     image_suffix, image_bytes = _decode_image_data_url(data_url)
     output_dir.mkdir(parents=True, exist_ok=True)
-    image_path = output_dir / f"online-dry-run{image_suffix}"
+    image_path = output_dir / f"{stem}{image_suffix}"
     image_path.write_bytes(image_bytes)
     return image_path
+
+
+def image_file_to_data_url(image_path: Path) -> str:
+    image_bytes = image_path.read_bytes()
+    if not image_bytes:
+        raise GenerationDryRunOutputError("Source image file was empty")
+    suffix = image_path.suffix.lower()
+    mime_type = _IMAGE_MIME_BY_SUFFIX.get(suffix, "image/png")
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def run_generation_dry_run(
@@ -161,6 +222,10 @@ def run_generation_dry_run(
     settings: ImageGenerationModelSettings | None = None,
 ) -> GenerationDryRunResult:
     active_settings = settings or ImageGenerationModelSettings.from_env()
+    refinement_instruction = (
+        "Refine this image to better match the visual intent while preserving subject and composition. "
+        "Improve style, coherence, and detail without changing the core scene."
+    )
     prompts = sample_prompts_from_local_source(
         prompt_source_root=DEFAULT_PROMPT_SOURCE_ROOT,
         candidate_count=DEFAULT_PROMPT_CANDIDATE_COUNT,
@@ -170,13 +235,46 @@ def run_generation_dry_run(
 
     for prompt in prompts:
         try:
-            image_data_url = generate_image_from_openrouter(
+            baseline_data_url = generate_image_from_openrouter(
                 prompt,
                 active_settings,
                 timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
-            image_path = save_generated_image(image_data_url, output_dir)
-            return GenerationDryRunResult(prompt=prompt, image_path=image_path)
+            baseline_image_path = save_generated_image(
+                baseline_data_url,
+                output_dir,
+                stem="online-dry-run-baseline",
+            )
+            source_image_data_url = image_file_to_data_url(baseline_image_path)
+            refined_prompt = f"{refinement_instruction}\n\nVisual intent:\n{prompt}"
+            try:
+                refined_data_url = generate_image_refinement_from_openrouter(
+                    refined_prompt,
+                    source_image_data_url,
+                    active_settings,
+                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+                )
+                used_image_conditioning = True
+            except requests.RequestException:
+                # Some image models support image output but not image-conditioned input.
+                refined_data_url = generate_image_from_openrouter(
+                    refined_prompt,
+                    active_settings,
+                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+                )
+                used_image_conditioning = False
+            refined_image_path = save_generated_image(
+                refined_data_url,
+                output_dir,
+                stem="online-dry-run-refined",
+            )
+            return GenerationDryRunResult(
+                prompt=prompt,
+                baseline_image_path=baseline_image_path,
+                refined_image_path=refined_image_path,
+                image_path=refined_image_path,
+                used_image_conditioning=used_image_conditioning,
+            )
         except GenerationDryRunOutputError as exc:
             last_failure = exc
 
@@ -217,12 +315,7 @@ def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
     if not mime_type.startswith("image/"):
         raise GenerationDryRunOutputError("Image data URL must have an image MIME type")
 
-    extension_by_mime = {
-        "image/png": ".png",
-        "image/jpeg": ".jpg",
-        "image/webp": ".webp",
-    }
-    image_suffix = extension_by_mime.get(mime_type)
+    image_suffix = _IMAGE_SUFFIX_BY_MIME.get(mime_type)
     if image_suffix is None:
         subtype = mime_type.removeprefix("image/").strip()
         if not subtype:
