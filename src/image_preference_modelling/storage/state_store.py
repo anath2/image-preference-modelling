@@ -20,7 +20,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -48,7 +48,7 @@ class StateStore:
     def _init_db(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA foreign_keys = ON;")
-            self._create_schema_v3(connection)
+            self._create_schema_v4(connection)
             self._migrate_to_latest(connection)
             connection.commit()
 
@@ -78,7 +78,7 @@ class StateStore:
             (str(version),),
         )
 
-    def _create_schema_v3(self, connection: sqlite3.Connection) -> None:
+    def _create_schema_v4(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_meta (
@@ -207,6 +207,20 @@ class StateStore:
                 FOREIGN KEY(job_id) REFERENCES aesthetic_jobs(id),
                 FOREIGN KEY(comparison_id) REFERENCES comparisons(id)
             );
+
+            CREATE TABLE IF NOT EXISTS gepa_candidates (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                parent_candidate_ids_json TEXT NOT NULL,
+                candidate_text TEXT NOT NULL,
+                compiled_prompt TEXT NOT NULL,
+                objective_scores_json TEXT NOT NULL,
+                frontier_member INTEGER NOT NULL DEFAULT 0,
+                created_by_run_id TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES aesthetic_jobs(id),
+                FOREIGN KEY(created_by_run_id) REFERENCES runs(id)
+            );
             """
         )
 
@@ -224,6 +238,10 @@ class StateStore:
         if current_version == 2:
             self._migrate_v2_to_v3(connection)
             current_version = 3
+
+        if current_version == 3:
+            self._migrate_v3_to_v4(connection)
+            current_version = 4
 
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
@@ -293,6 +311,26 @@ class StateStore:
             """
         )
         self._set_schema_version(connection, 3)
+
+    def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gepa_candidates (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                parent_candidate_ids_json TEXT NOT NULL,
+                candidate_text TEXT NOT NULL,
+                compiled_prompt TEXT NOT NULL,
+                objective_scores_json TEXT NOT NULL,
+                frontier_member INTEGER NOT NULL DEFAULT 0,
+                created_by_run_id TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES aesthetic_jobs(id),
+                FOREIGN KEY(created_by_run_id) REFERENCES runs(id)
+            )
+            """
+        )
+        self._set_schema_version(connection, 4)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -671,6 +709,108 @@ class StateStore:
             connection.commit()
         return rollout_id
 
+    def create_gepa_candidate(
+        self,
+        *,
+        job_id: str,
+        parent_candidate_ids: list[str],
+        candidate_text: str,
+        compiled_prompt: str,
+        objective_scores: dict[str, float],
+        created_by_run_id: str | None,
+    ) -> str:
+        if self.get_aesthetic_job(job_id) is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        if created_by_run_id is not None and self.get_run(created_by_run_id) is None:
+            raise ValueError(f"Run {created_by_run_id} does not exist")
+
+        candidate_id = f"candidate_{uuid.uuid4().hex[:10]}"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO gepa_candidates(
+                    id, job_id, parent_candidate_ids_json, candidate_text,
+                    compiled_prompt, objective_scores_json, frontier_member,
+                    created_by_run_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate_id,
+                    job_id,
+                    json.dumps(parent_candidate_ids),
+                    candidate_text,
+                    compiled_prompt,
+                    json.dumps(objective_scores),
+                    0,
+                    created_by_run_id,
+                    _utc_now(),
+                ),
+            )
+            connection.commit()
+        return candidate_id
+
+    def list_gepa_candidates_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, job_id, parent_candidate_ids_json, candidate_text, compiled_prompt,
+                       objective_scores_json, frontier_member, created_by_run_id, created_at
+                FROM gepa_candidates
+                WHERE job_id = ?
+                ORDER BY created_at DESC
+                """,
+                (job_id,),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["parent_candidate_ids"] = json.loads(item.pop("parent_candidate_ids_json"))
+            item["objective_scores"] = json.loads(item.pop("objective_scores_json"))
+            item["frontier_member"] = bool(item["frontier_member"])
+            results.append(item)
+        return results
+
+    def set_candidate_frontier_membership(self, candidate_id: str, frontier_member: bool) -> None:
+        with self._connect() as connection:
+            candidate = connection.execute(
+                "SELECT id FROM gepa_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"GEPA candidate {candidate_id} does not exist")
+            connection.execute(
+                "UPDATE gepa_candidates SET frontier_member = ? WHERE id = ?",
+                (1 if frontier_member else 0, candidate_id),
+            )
+            connection.commit()
+
+    def promote_job_candidate(self, job_id: str, candidate_id: str) -> None:
+        with self._connect() as connection:
+            job = connection.execute(
+                "SELECT id FROM aesthetic_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError(f"Aesthetic job {job_id} does not exist")
+            candidate = connection.execute(
+                "SELECT id, job_id, compiled_prompt FROM gepa_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"GEPA candidate {candidate_id} does not exist")
+            if candidate["job_id"] != job_id:
+                raise ValueError("Cannot promote candidate for a different aesthetic job")
+            connection.execute(
+                """
+                UPDATE aesthetic_jobs
+                SET active_candidate_id = ?, compiled_gepa_prompt = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (candidate_id, candidate["compiled_prompt"], _utc_now(), job_id),
+            )
+            connection.commit()
+
     def mark_rollout_feedback_complete(self, rollout_id: str, comparison_id: str) -> None:
         completed_at = _utc_now()
         with self._connect() as connection:
@@ -710,6 +850,77 @@ class StateStore:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def count_completed_rollouts_for_job(self, job_id: str) -> int:
+        with self._connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM rollouts
+                WHERE job_id = ? AND status = 'feedback_complete'
+                """,
+                (job_id,),
+            ).fetchone()[0]
+        return int(count)
+
+    def list_completed_rollout_ids_for_job(self, job_id: str, limit: int) -> list[str]:
+        bounded_limit = max(1, int(limit))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM rollouts
+                WHERE job_id = ? AND status = 'feedback_complete'
+                ORDER BY feedback_completed_at DESC
+                LIMIT ?
+                """,
+                (job_id, bounded_limit),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def get_completed_rollouts_with_feedback(
+        self, job_id: str, rollout_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        if not rollout_ids:
+            return []
+
+        placeholders = ", ".join("?" for _ in rollout_ids)
+        params: tuple[Any, ...] = (job_id, *rollout_ids)
+        query = f"""
+            SELECT
+                r.id,
+                r.job_id,
+                r.prompt_text,
+                r.intent_text,
+                r.baseline_image_uri,
+                r.refined_image_uri,
+                r.candidate_id,
+                r.refinement_prompt,
+                r.model_config_json,
+                r.status,
+                r.created_at,
+                r.feedback_completed_at,
+                r.comparison_id,
+                c.winner,
+                c.outcome,
+                c.critique
+            FROM rollouts r
+            JOIN comparisons c ON c.id = r.comparison_id
+            WHERE
+                r.job_id = ?
+                AND r.status = 'feedback_complete'
+                AND r.id IN ({placeholders})
+            ORDER BY r.feedback_completed_at DESC
+        """
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["model_config"] = json.loads(item.pop("model_config_json"))
+            items.append(item)
+        return items
 
     def list_recent_comparisons(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as connection:
