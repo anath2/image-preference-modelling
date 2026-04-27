@@ -6,6 +6,25 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 
+def _load_openrouter_config(model_env_var: str, *, context_label: str) -> tuple[str, str, str]:
+    load_dotenv(override=False)
+    model_value = os.getenv(model_env_var, "").strip()
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    base_url = os.getenv("OPENROUTER_BASE_URL", "").strip() or "https://openrouter.ai/api/v1"
+
+    missing: list[str] = []
+    if not model_value:
+        missing.append(model_env_var)
+    if not api_key:
+        missing.append("OPENROUTER_API_KEY")
+
+    if missing:
+        missing_joined = ", ".join(missing)
+        raise ValueError(f"Missing required environment variables for {context_label}: {missing_joined}")
+
+    return model_value, api_key, base_url.rstrip("/")
+
+
 @dataclass(frozen=True)
 class PromptRewriteModelSettings:
     prompt_model: str
@@ -15,20 +34,9 @@ class PromptRewriteModelSettings:
     @classmethod
     def from_env(cls) -> "PromptRewriteModelSettings":
         # Load local .env for developer runs without overriding exported env vars.
-        load_dotenv(override=False)
-        prompt_model = os.getenv("PROMPT_MODEL", "").strip()
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        base_url = os.getenv("OPENROUTER_BASE_URL", "").strip() or "https://openrouter.ai/api/v1"
-
-        missing: list[str] = []
-        if not prompt_model:
-            missing.append("PROMPT_MODEL")
-        if not api_key:
-            missing.append("OPENROUTER_API_KEY")
-
-        if missing:
-            missing_joined = ", ".join(missing)
-            raise ValueError(f"Missing required environment variables for prompt rewrite: {missing_joined}")
+        prompt_model, api_key, base_url = _load_openrouter_config(
+            "PROMPT_MODEL", context_label="prompt rewrite"
+        )
 
         return cls(
             prompt_model=prompt_model,
@@ -45,22 +53,9 @@ class ImageGenerationModelSettings:
 
     @classmethod
     def from_env(cls) -> "ImageGenerationModelSettings":
-        load_dotenv(override=False)
-        image_model = os.getenv("IMAGE_MODEL", "").strip()
-        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        base_url = os.getenv("OPENROUTER_BASE_URL", "").strip() or "https://openrouter.ai/api/v1"
-
-        missing: list[str] = []
-        if not image_model:
-            missing.append("IMAGE_MODEL")
-        if not api_key:
-            missing.append("OPENROUTER_API_KEY")
-
-        if missing:
-            missing_joined = ", ".join(missing)
-            raise ValueError(
-                f"Missing required environment variables for image generation: {missing_joined}"
-            )
+        image_model, api_key, base_url = _load_openrouter_config(
+            "IMAGE_MODEL", context_label="image generation"
+        )
 
         return cls(
             image_model=image_model,

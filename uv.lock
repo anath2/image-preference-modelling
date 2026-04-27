@@ -425,7 +425,6 @@ name = "image-preference-modelling"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "fastapi" },
     { name = "gradio" },
     { name = "pyarrow" },
     { name = "python-dotenv" },
@@ -439,7 +438,6 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastapi", specifier = ">=0.128.8" },
     { name = "gradio", specifier = ">=5.49.1" },
     { name = "pyarrow", specifier = ">=24.0.0" },
     { name = "python-dotenv", specifier = ">=1.1.1" },

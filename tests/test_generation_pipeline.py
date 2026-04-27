@@ -26,6 +26,47 @@ class _FakeResponse:
         return self._json_payload
 
 
+def _image_payload(data_url: str = "data:image/png;base64,aGVsbG8=") -> dict[str, object]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "images": [
+                        {
+                            "image_url": {
+                                "url": data_url,
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+
+def _capture_openrouter_post(
+    captured_payload: dict[str, object],
+    *,
+    expected_url: str,
+    expected_auth_header: str,
+    expected_timeout: float,
+) -> callable:
+    def _fake_post(
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _FakeResponse:
+        assert url == expected_url
+        assert headers["Authorization"] == expected_auth_header
+        assert timeout == expected_timeout
+        captured_payload.update(json)
+        return _FakeResponse(json_payload=_image_payload())
+
+    return _fake_post
+
+
 def _prompt_parquet_bytes(prompts: list[str]) -> bytes:
     pa = importlib.import_module("pyarrow")
     pq = importlib.import_module("pyarrow.parquet")
@@ -195,9 +236,26 @@ def test_run_generation_dry_run_loads_shared_image_settings(
         calls["timeout_seconds"] = timeout_seconds
         return "data:image/png;base64,aGVsbG8="
 
+    def _fake_refine_image(
+        prompt: str,
+        source_image_data_url: str,
+        settings: ImageGenerationModelSettings,
+        *,
+        timeout_seconds: float = 60.0,
+    ) -> str:
+        calls["refine_prompt"] = prompt
+        calls["source_image_data_url"] = source_image_data_url
+        calls["refine_settings"] = settings
+        calls["refine_timeout_seconds"] = timeout_seconds
+        return "data:image/png;base64,d29ybGQ="
+
     monkeypatch.setattr(
         "image_preference_modelling.generation_pipeline.generate_image_from_openrouter",
         _fake_generate_image,
+    )
+    monkeypatch.setattr(
+        "image_preference_modelling.generation_pipeline.generate_image_refinement_from_openrouter",
+        _fake_refine_image,
     )
 
     result = run_generation_dry_run(output_dir=tmp_path / "data")
@@ -205,8 +263,15 @@ def test_run_generation_dry_run_loads_shared_image_settings(
     assert calls["prompt"] == "test prompt"
     assert calls["settings"] == resolved_settings
     assert calls["timeout_seconds"] == 60.0
+    assert calls["refine_settings"] == resolved_settings
+    assert calls["refine_timeout_seconds"] == 60.0
+    assert isinstance(calls["source_image_data_url"], str)
+    assert str(calls["source_image_data_url"]).startswith("data:image/png;base64,")
     assert result.prompt == "test prompt"
     assert result.image_path.exists()
+    assert result.baseline_image_path.exists()
+    assert result.refined_image_path.exists()
+    assert result.image_path == result.refined_image_path
     assert result.image_path.parent == tmp_path / "data"
 
 
@@ -240,9 +305,22 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
             raise GenerationDryRunOutputError("OpenRouter response missing images")
         return "data:image/png;base64,aGVsbG8="
 
+    def _fake_refine_image(
+        prompt: str,
+        source_image_data_url: str,
+        settings: ImageGenerationModelSettings,
+        *,
+        timeout_seconds: float = 60.0,
+    ) -> str:
+        return "data:image/png;base64,d29ybGQ="
+
     monkeypatch.setattr(
         "image_preference_modelling.generation_pipeline.generate_image_from_openrouter",
         _fake_generate_image,
+    )
+    monkeypatch.setattr(
+        "image_preference_modelling.generation_pipeline.generate_image_refinement_from_openrouter",
+        _fake_refine_image,
     )
 
     result = run_generation_dry_run(output_dir=tmp_path / "data", settings=settings)
@@ -250,6 +328,8 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
     assert attempted_prompts == ["unsafe candidate", "successful candidate"]
     assert result.prompt == "successful candidate"
     assert result.image_path.exists()
+    assert result.baseline_image_path.exists()
+    assert result.refined_image_path.exists()
 
 
 def test_generate_image_from_openrouter_requests_image_only_output(
@@ -262,36 +342,16 @@ def test_generate_image_from_openrouter_requests_image_only_output(
     )
     captured_payload: dict[str, object] = {}
 
-    def _fake_post(
-        url: str,
-        *,
-        json: dict[str, object],
-        headers: dict[str, str],
-        timeout: float,
-    ) -> _FakeResponse:
-        assert url == "https://openrouter.example/api/v1/chat/completions"
-        assert headers["Authorization"] == "Bearer secret"
-        assert timeout == 60.0
-        captured_payload.update(json)
-        return _FakeResponse(
-            json_payload={
-                "choices": [
-                    {
-                        "message": {
-                            "images": [
-                                {
-                                    "image_url": {
-                                        "url": "data:image/png;base64,aGVsbG8="
-                                    }
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-        )
-
-    monkeypatch.setattr(generation_pipeline.requests, "post", _fake_post)
+    monkeypatch.setattr(
+        generation_pipeline.requests,
+        "post",
+        _capture_openrouter_post(
+            captured_payload,
+            expected_url="https://openrouter.example/api/v1/chat/completions",
+            expected_auth_header="Bearer secret",
+            expected_timeout=60.0,
+        ),
+    )
 
     image_data_url = generation_pipeline.generate_image_from_openrouter(
         "A cinematic fox in a moonlit forest",
@@ -300,4 +360,47 @@ def test_generate_image_from_openrouter_requests_image_only_output(
 
     assert captured_payload["model"] == "bytedance-seed/seedream-4.5"
     assert captured_payload["modalities"] == ["image"]
+    assert image_data_url == "data:image/png;base64,aGVsbG8="
+
+
+def test_generate_image_refinement_from_openrouter_sends_text_and_image_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = ImageGenerationModelSettings(
+        image_model="google/gemini-2.5-flash-image",
+        openrouter_api_key="secret",
+        openrouter_base_url="https://openrouter.example/api/v1",
+    )
+    captured_payload: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        generation_pipeline.requests,
+        "post",
+        _capture_openrouter_post(
+            captured_payload,
+            expected_url="https://openrouter.example/api/v1/chat/completions",
+            expected_auth_header="Bearer secret",
+            expected_timeout=60.0,
+        ),
+    )
+
+    image_data_url = generation_pipeline.generate_image_refinement_from_openrouter(
+        "Refine this image",
+        "data:image/png;base64,dGVzdA==",
+        settings,
+    )
+
+    assert captured_payload["model"] == "google/gemini-2.5-flash-image"
+    assert captured_payload["modalities"] == ["image"]
+    messages = captured_payload["messages"]
+    assert isinstance(messages, list)
+    first_message = messages[0]
+    assert isinstance(first_message, dict)
+    content = first_message["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "Refine this image"}
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,dGVzdA=="},
+    }
     assert image_data_url == "data:image/png;base64,aGVsbG8="

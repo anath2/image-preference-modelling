@@ -1,252 +1,198 @@
 from __future__ import annotations
 
-from typing import Any
+import random
+from pathlib import Path
 
 import gradio as gr
 
 from image_preference_modelling.app_context import AppContext, default_context
+from image_preference_modelling.config import ImageGenerationModelSettings
+from image_preference_modelling.generation_pipeline import (
+    DEFAULT_PROMPT_SOURCE_ROOT,
+    DEFAULT_PROMPT_CANDIDATE_COUNT,
+    DEFAULT_TIMEOUT_SECONDS,
+    generate_image_from_openrouter,
+    generate_image_refinement_from_openrouter,
+    image_file_to_data_url,
+    sample_prompts_from_local_source,
+    save_generated_image,
+)
 
 
-def _table_markdown(rows: list[dict[str, Any]], columns: list[str]) -> str:
-    if not rows:
-        return "_No records yet._"
-
-    header = "| " + " | ".join(columns) + " |"
-    divider = "| " + " | ".join(["---"] * len(columns)) + " |"
-    body = [
-        "| " + " | ".join(str(row.get(column, "")) for column in columns) + " |"
-        for row in rows
-    ]
-    return "\n".join([header, divider, *body])
+def _workflow_output_dir() -> Path:
+    output_dir = Path(".local") / "artifacts" / "ui_workflow"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
 
 
 def build_app(context: AppContext | None = None) -> gr.Blocks:
     ctx = context or default_context()
+    output_dir = _workflow_output_dir()
 
     with gr.Blocks(title="Gradio Operator Cockpit") as app:
-        gr.Markdown("# Gradio Operator Cockpit")
+        gr.Markdown("# Image Preference Workflow")
         gr.Markdown(
-            "Control plane for prompt-generation runs, review sessions, reward-model tracking, and GEPA/evaluation workflows."
+            "Sample a prompt, generate baseline image, edit reprompt, regenerate, then score the winner."
         )
 
-        with gr.Tab("Overview"):
-            overview_output = gr.JSON(label="Current metrics")
-            refresh_overview = gr.Button("Refresh overview")
-            refresh_overview.click(lambda: ctx.state_store.overview_metrics(), outputs=overview_output)
+        prompt_state = gr.State(value="")
+        baseline_path_state = gr.State(value="")
+        regenerated_path_state = gr.State(value="")
+        session_id_state = gr.State(value="")
 
-        with gr.Tab("Prompt Sets"):
-            gr.Markdown(
-                "\n".join(
-                    [
-                        "### Prompt Set Registry",
-                        "- Ingestion and cleaning pipelines are tracked as run configs in `Runs`.",
-                        "- Coverage and split diagnostics can be attached as artifacts to prompt-set preparation runs.",
-                    ]
-                )
+        with gr.Row():
+            sample_prompt_btn = gr.Button("Sample Prompt")
+            generate_baseline_btn = gr.Button("Generate Baseline")
+            regenerate_btn = gr.Button("Regenerate")
+
+        sampled_prompt = gr.Textbox(label="Sampled Prompt", interactive=False)
+        reprompt_text = gr.Textbox(label="Reprompt", placeholder="Edit reprompt before regenerate")
+
+        with gr.Row():
+            baseline_image = gr.Image(label="Baseline", type="filepath")
+            regenerated_image = gr.Image(label="Regenerated", type="filepath")
+
+        winner_choice = gr.Radio(
+            choices=["baseline", "regenerated", "tie"],
+            value="tie",
+            label="Winner",
+        )
+        critique_text = gr.Textbox(label="Critique (optional)")
+        submit_score_btn = gr.Button("Submit Score")
+        workflow_status = gr.Markdown("Ready. Start with `Sample Prompt`.")
+
+        def _sample_prompt() -> tuple[str, str, str]:
+            prompts = sample_prompts_from_local_source(
+                prompt_source_root=DEFAULT_PROMPT_SOURCE_ROOT,
+                candidate_count=DEFAULT_PROMPT_CANDIDATE_COUNT,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
+            selected = random.choice(prompts).strip()
+            return selected, selected, "Prompt sampled. Click `Generate Baseline`."
 
-        with gr.Tab("Runs"):
-            with gr.Row():
-                run_type = gr.Dropdown(
-                    choices=["generation", "reward_model", "gepa", "evaluation"],
-                    value="generation",
-                    label="Run type",
-                )
-                display_name = gr.Textbox(label="Display name", value="New run")
-            run_config = gr.Code(
-                label="Run config JSON",
-                language="json",
-                value='{\n  "note": "update with run parameters"\n}',
+        def _generate_baseline(prompt: str) -> tuple[str | None, str, str]:
+            cleaned_prompt = prompt.strip()
+            if not cleaned_prompt:
+                return None, "", "Sample a prompt first."
+
+            settings = ImageGenerationModelSettings.from_env()
+            baseline_data_url = generate_image_from_openrouter(
+                cleaned_prompt,
+                settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
-            launch_run = gr.Button("Create run")
-            start_run = gr.Button("Dispatch selected run")
-            cancel_run = gr.Button("Cancel selected run")
-            selected_run_id = gr.Textbox(label="Run ID")
-            run_status = gr.Markdown()
-            run_list = gr.Markdown(label="Recent runs")
-            run_log_output = gr.Code(label="Run log", interactive=False)
-            refresh_runs = gr.Button("Refresh runs")
-            refresh_run_log = gr.Button("Refresh selected run log")
-
-            def _create_run(run_type_value: str, name_value: str, config_value: str) -> tuple[str, str]:
-                config: dict[str, Any]
-                try:
-                    import json
-
-                    config = json.loads(config_value)
-                except Exception as exc:  # noqa: BLE001 - displayed in UI
-                    return "", f"Invalid JSON config: {exc}"
-
-                run_id = ctx.state_store.create_run(
-                    run_type=run_type_value,
-                    display_name=name_value,
-                    config=config,
-                )
-                rows = ctx.state_store.list_runs()
-                return run_id, _table_markdown(
-                    rows,
-                    ["id", "run_type", "display_name", "status", "created_at", "finished_at"],
-                )
-
-            def _start_run(run_id: str) -> str:
-                if not run_id.strip():
-                    return "Provide a run id first."
-                try:
-                    message = ctx.job_launcher.dispatch_run(run_id.strip())
-                except ValueError as exc:
-                    return str(exc)
-                return message
-
-            def _cancel_run(run_id: str) -> str:
-                if not run_id.strip():
-                    return "Provide a run id first."
-                try:
-                    return ctx.job_launcher.cancel_run(run_id.strip())
-                except ValueError as exc:
-                    return str(exc)
-
-            def _read_run_log(run_id: str) -> str:
-                if not run_id.strip():
-                    return "Select a run id to load logs."
-                run = ctx.state_store.get_run(run_id.strip())
-                if run is None:
-                    return f"Run {run_id.strip()} not found."
-                events = ctx.state_store.list_run_events(run_id.strip())
-                if not events:
-                    return "No run events yet."
-                return "\n".join(
-                    f"{event['created_at']} [{event['level']}] {event['message']}" for event in events
-                )
-
-            launch_run.click(_create_run, inputs=[run_type, display_name, run_config], outputs=[selected_run_id, run_list])
-            start_run.click(_start_run, inputs=selected_run_id, outputs=run_status)
-            cancel_run.click(_cancel_run, inputs=selected_run_id, outputs=run_status)
-            refresh_runs.click(
-                lambda: _table_markdown(
-                    ctx.state_store.list_runs(),
-                    ["id", "run_type", "display_name", "status", "created_at", "finished_at"],
-                ),
-                outputs=run_list,
+            baseline_path = save_generated_image(
+                baseline_data_url,
+                output_dir,
+                stem="ui-baseline",
             )
-            refresh_run_log.click(_read_run_log, inputs=selected_run_id, outputs=run_log_output)
+            return str(baseline_path), str(baseline_path), "Baseline generated. Edit reprompt and click `Regenerate`."
 
-        with gr.Tab("Review Queue"):
-            session_name = gr.Textbox(label="Session name", value="bootstrap-session")
-            create_session = gr.Button("Create rating session")
-            session_id_output = gr.Textbox(label="Session ID")
+        def _regenerate(prompt: str, reprompt: str, baseline_path: str) -> tuple[str | None, str, str]:
+            cleaned_prompt = prompt.strip()
+            cleaned_reprompt = reprompt.strip()
+            if not cleaned_prompt:
+                return None, "", "Sample a prompt first."
+            if not baseline_path.strip():
+                return None, "", "Generate baseline first."
+            if not cleaned_reprompt:
+                return None, "", "Reprompt is required."
 
-            prompt_text = gr.Textbox(label="Prompt text")
-            left_uri = gr.Textbox(label="Left image URI")
-            right_uri = gr.Textbox(label="Right image URI")
-            winner = gr.Radio(
-                choices=["left", "right", "none"],
-                label="Winner",
-                value="none",
+            baseline_image_path = Path(baseline_path)
+            if not baseline_image_path.exists():
+                return None, "", "Baseline image file is missing. Regenerate baseline."
+
+            settings = ImageGenerationModelSettings.from_env()
+            source_image_data_url = image_file_to_data_url(baseline_image_path)
+            refined_data_url = generate_image_refinement_from_openrouter(
+                f"{cleaned_reprompt}\n\nOriginal prompt:\n{cleaned_prompt}",
+                source_image_data_url,
+                settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
-            outcome = gr.Dropdown(
-                choices=["winner", "both_good", "both_bad", "cant_decide"],
-                value="winner",
-                label="Outcome",
+            regenerated_path = save_generated_image(
+                refined_data_url,
+                output_dir,
+                stem="ui-regenerated",
             )
-            critique = gr.Textbox(label="One-line critique")
-            submit_comparison = gr.Button("Save comparison")
-            comparison_status = gr.Markdown()
-            review_hint = gr.Markdown("Submit a comparison to reveal the next queue hint.")
-            recent_comparisons = gr.Markdown(label="Recent comparisons")
-            refresh_comparisons = gr.Button("Refresh comparisons")
+            return str(regenerated_path), str(regenerated_path), "Regenerated image ready. Pick winner and submit score."
 
-            create_session.click(
-                lambda name: ctx.state_store.create_rating_session(name),
-                inputs=session_name,
-                outputs=session_id_output,
+        def _submit_score(
+            prompt: str,
+            baseline_path: str,
+            regenerated_path: str,
+            winner: str,
+            critique: str,
+            session_id: str,
+        ) -> tuple[str, str]:
+            cleaned_prompt = prompt.strip()
+            left_uri = baseline_path.strip()
+            right_uri = regenerated_path.strip()
+            if not cleaned_prompt:
+                return "Prompt is required before scoring.", session_id
+            if not left_uri or not right_uri:
+                return "Generate both baseline and regenerated images before scoring.", session_id
+            if left_uri == right_uri:
+                return "Baseline and regenerated image URIs must differ.", session_id
+
+            active_session_id = session_id.strip()
+            if not active_session_id:
+                active_session_id = ctx.state_store.create_rating_session("ui-workflow-session")
+
+            if winner == "baseline":
+                winner_value = "left"
+                outcome = "winner"
+            elif winner == "regenerated":
+                winner_value = "right"
+                outcome = "winner"
+            else:
+                winner_value = None
+                outcome = "cant_decide"
+
+            ctx.state_store.add_comparison(
+                session_id=active_session_id,
+                prompt_text=cleaned_prompt,
+                left_image_uri=left_uri,
+                right_image_uri=right_uri,
+                winner=winner_value,
+                critique=critique,
+                outcome=outcome,
             )
+            return f"Score saved in session `{active_session_id}`.", active_session_id
 
-            def _submit_comparison(
-                session_id: str,
-                prompt: str,
-                left: str,
-                right: str,
-                winner_choice: str,
-                critique_text: str,
-                outcome_choice: str,
-            ) -> str:
-                if not session_id.strip():
-                    return "Create or provide a rating session id first."
-                if not prompt.strip():
-                    return "Prompt text is required."
-                if not left.strip() or not right.strip():
-                    return "Both left and right image URIs are required."
-                if left.strip() == right.strip():
-                    return "Left and right image URIs must differ."
-                winner_value = None if winner_choice == "none" else winner_choice
-                if outcome_choice == "winner" and winner_value is None:
-                    return "Outcome `winner` requires choosing left or right."
-                ctx.state_store.add_comparison(
-                    session_id=session_id.strip(),
-                    prompt_text=prompt,
-                    left_image_uri=left,
-                    right_image_uri=right,
-                    winner=winner_value,
-                    critique=critique_text,
-                    outcome=outcome_choice,
-                )
-                return "Comparison saved."
+        sample_prompt_btn.click(
+            _sample_prompt,
+            outputs=[sampled_prompt, reprompt_text, workflow_status],
+        ).then(
+            lambda sampled: sampled,
+            inputs=sampled_prompt,
+            outputs=prompt_state,
+        )
 
-            def _next_review_hint() -> str:
-                rows = ctx.state_store.list_recent_comparisons(limit=1)
-                if not rows:
-                    return "No comparisons logged yet. Start with a seeded prompt pair."
-                last = rows[0]
-                if last["outcome"] == "cant_decide":
-                    return "Last item was undecided. Queue a clarifying prompt variant next."
-                return f"Last outcome: `{last['outcome']}`. Continue with the next unresolved prompt pair."
+        generate_baseline_btn.click(
+            _generate_baseline,
+            inputs=sampled_prompt,
+            outputs=[baseline_image, baseline_path_state, workflow_status],
+        )
 
-            submit_comparison.click(
-                _submit_comparison,
-                inputs=[session_id_output, prompt_text, left_uri, right_uri, winner, critique, outcome],
-                outputs=comparison_status,
-            )
-            submit_comparison.click(_next_review_hint, outputs=review_hint)
-            refresh_comparisons.click(
-                lambda: _table_markdown(
-                    ctx.state_store.list_recent_comparisons(),
-                    ["id", "rating_session_id", "winner", "outcome", "created_at", "critique"],
-                ),
-                outputs=recent_comparisons,
-            )
+        regenerate_btn.click(
+            _regenerate,
+            inputs=[sampled_prompt, reprompt_text, baseline_path_state],
+            outputs=[regenerated_image, regenerated_path_state, workflow_status],
+        )
 
-        with gr.Tab("Reward Model"):
-            gr.Markdown(
-                "\n".join(
-                    [
-                        "### Reward Model Registry",
-                        "- Use `Runs` with `run_type=reward_model` to create and track training jobs.",
-                        "- Attach agreement metrics and checkpoints to each run artifact directory.",
-                    ]
-                )
-            )
-
-        with gr.Tab("Rewriter / GEPA"):
-            gr.Markdown(
-                "\n".join(
-                    [
-                        "### GEPA Workspace",
-                        "- Launch GEPA iterations from `Runs` with `run_type=gepa`.",
-                        "- Store candidate prompt variants and frontier summaries as run artifacts.",
-                    ]
-                )
-            )
-
-        with gr.Tab("Evaluation"):
-            gr.Markdown(
-                "\n".join(
-                    [
-                        "### Blind Evaluation",
-                        "- Launch eval batches from `Runs` with `run_type=evaluation`.",
-                        "- Compare baseline vs promoted rewriter using blind pairwise results in `Review Queue`.",
-                    ]
-                )
-            )
+        submit_score_btn.click(
+            _submit_score,
+            inputs=[
+                prompt_state,
+                baseline_path_state,
+                regenerated_path_state,
+                winner_choice,
+                critique_text,
+                session_id_state,
+            ],
+            outputs=[workflow_status, session_id_state],
+        )
 
     return app
 

@@ -13,14 +13,29 @@ def _build_context(tmp_path: Path) -> AppContext:
     return AppContext(state_store=store, job_launcher=JobLauncher(store))
 
 
-def test_build_app_uses_plain_code_component_for_run_logs(tmp_path: Path) -> None:
+def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     app = build_app(_build_context(tmp_path))
 
-    run_log_output = next(
-        block
+    buttons = {
+        block.value
         for block in app.blocks.values()
-        if isinstance(block, gr.Code) and block.label == "Run log"
+        if isinstance(block, gr.Button) and isinstance(block.value, str)
+    }
+    labels = {
+        block.label
+        for block in app.blocks.values()
+        if isinstance(block, (gr.Textbox, gr.Image, gr.Radio))
+    }
+    winner_radio = next(
+        block for block in app.blocks.values() if isinstance(block, gr.Radio) and block.label == "Winner"
     )
 
-    assert run_log_output.language is None
-    assert run_log_output.interactive is False
+    assert "Sample Prompt" in buttons
+    assert "Generate Baseline" in buttons
+    assert "Regenerate" in buttons
+    assert "Submit Score" in buttons
+    assert "Sampled Prompt" in labels
+    assert "Reprompt" in labels
+    assert "Baseline" in labels
+    assert "Regenerated" in labels
+    assert tuple(choice[0] for choice in winner_radio.choices) == ("baseline", "regenerated", "tie")
