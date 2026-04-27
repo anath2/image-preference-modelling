@@ -128,6 +128,7 @@ def test_gepa_run_config_preserves_job_id_and_minibatch_size(tmp_path: Path) -> 
             "job_id": job_id,
             "minibatch_size": 1,
             "selected_rollout_ids": [rollout_id],
+            "optimizer_backend": "heuristic_fallback",
         },
     )
 
