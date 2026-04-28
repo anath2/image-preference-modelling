@@ -47,6 +47,8 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Generate Candidate" in buttons
     assert "Submit Score" in buttons
     assert "Create Job" in buttons
+    assert "Update Selected Job" in buttons
+    assert "Archive Selected Job" in buttons
     assert "Use Selected Job" in buttons
     assert "Refresh Jobs" in buttons
     assert "Run GEPA Optimization" in buttons
@@ -54,9 +56,11 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Show GEPA Run Logs" in buttons
     assert "Active Job" in labels
     assert "Selected Job Name" in labels
-    assert "Compiled GEPA Prompt" in labels
+    assert "Latest System Prompt" in labels
     assert "New Job Name" in labels
-    assert "Seed Refinement Prompt" in labels
+    assert "Seed System Prompt" in labels
+    assert "Guided Sampling Category" in labels
+    assert "GEPA Enable Threshold" in labels
     assert "Completed Feedback Count" in labels
     assert "GEPA Minibatch Size" in labels
     assert "Latest GEPA Run Status" in labels
@@ -107,15 +111,17 @@ def test_resolve_active_system_prompt_prefers_compiled_prompt() -> None:
         _resolve_active_system_prompt(
             {
                 "seed_system_prompt": "seed prompt",
+                "latest_system_prompt": "latest prompt",
                 "compiled_system_prompt": "compiled prompt",
             }
         )
-        == "compiled prompt"
+        == "latest prompt"
     )
     assert (
         _resolve_active_system_prompt(
             {
                 "seed_system_prompt": "seed prompt",
+                "latest_system_prompt": "",
                 "compiled_system_prompt": "",
             }
         )

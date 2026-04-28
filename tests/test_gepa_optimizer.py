@@ -101,6 +101,8 @@ def test_run_gepa_optimization_writes_checkpoint_and_promotes_candidate(tmp_path
     assert job is not None
     assert job["active_candidate_id"] == checkpoint["new_candidate_id"]
     assert job["compiled_system_prompt"] == checkpoint["compiled_prompt"]
+    assert job["baseline_system_prompt"] == "Improve cinematic depth while preserving layout."
+    assert job["latest_system_prompt"] == checkpoint["compiled_prompt"]
 
 
 def test_run_gepa_optimization_falls_back_when_dspy_not_configured(

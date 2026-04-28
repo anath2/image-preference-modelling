@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 5
+    assert store.schema_version() == 7
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -330,7 +330,7 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 5
+    assert store.schema_version() == 7
 
     job = store.get_aesthetic_job("job_legacy")
     assert job is not None
@@ -370,6 +370,8 @@ def test_aesthetic_job_crud_and_policy_update(tmp_path: Path) -> None:
     assert updated is not None
     assert updated["active_candidate_id"] == "candidate_001"
     assert updated["compiled_system_prompt"] == "Prefer richer neon contrast."
+    assert updated["baseline_system_prompt"] == ""
+    assert updated["latest_system_prompt"] == "Improve lighting and texture while preserving composition."
 
 
 def test_create_rollout_and_mark_feedback_complete(tmp_path: Path) -> None:
@@ -410,6 +412,9 @@ def test_create_rollout_and_mark_feedback_complete(tmp_path: Path) -> None:
     assert completed[0]["comparison_id"] == comparison_id
     assert completed[0]["candidate_image_uri"] == "candidate.png"
     assert completed[0]["system_prompt"] == "Enhance natural warm tones."
+    assert completed[0]["selection_mode"] is None
+    assert completed[0]["llm_score"] is None
+    assert completed[0]["llm_reason"] is None
     assert completed[0]["generation_mode"] == "text_only"
     assert store.count_completed_rollouts_for_job(job_id) == 1
     assert store.list_completed_rollout_ids_for_job(job_id, limit=3) == [rollout_id]
@@ -468,3 +473,98 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert job is not None
     assert job["active_candidate_id"] == candidate_id
     assert job["compiled_system_prompt"] == "Use moody shadows and controlled highlights."
+    assert job["baseline_system_prompt"] == "Increase contrast while preserving scene composition."
+    assert job["latest_system_prompt"] == "Use moody shadows and controlled highlights."
+
+
+def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="portrait",
+        description="portrait style",
+        seed_system_prompt="seed prompt",
+        sampling_profile={"category": "portrait"},
+        gepa_enable_threshold=2,
+    )
+    store.update_aesthetic_job(
+        job_id,
+        name="portrait-v2",
+        description="portrait style v2",
+        sampling_profile={"category": "outdoor_landscape"},
+        gepa_enable_threshold=3,
+    )
+    updated = store.get_aesthetic_job(job_id)
+    assert updated is not None
+    assert updated["name"] == "portrait-v2"
+    assert updated["description"] == "portrait style v2"
+    assert updated["gepa_enable_threshold"] == 3
+
+    session_id = store.create_rating_session(name="gate-session")
+    rollout_a = store.create_rollout(
+        job_id=job_id,
+        prompt_text="p1",
+        intent_text="p1",
+        baseline_image_uri="baseline-1.png",
+        candidate_image_uri="candidate-1.png",
+        candidate_id=None,
+        system_prompt="latest-1",
+        baseline_system_prompt_snapshot="",
+        latest_system_prompt_snapshot="seed prompt",
+        prompt_category="outdoor_landscape",
+        selection_mode="llm_guided",
+        llm_score=0.88,
+        llm_reason="Strong match",
+        generation_mode="text_only",
+        model_config={"m": 1},
+    )
+    cmp_a = store.add_comparison(
+        session_id=session_id,
+        prompt_text="p1",
+        left_image_uri="baseline-1.png",
+        right_image_uri="candidate-1.png",
+        winner="left",
+        critique="baseline better",
+        outcome="winner",
+    )
+    store.mark_rollout_feedback_complete(rollout_a, cmp_a)
+    rollout_b = store.create_rollout(
+        job_id=job_id,
+        prompt_text="p2",
+        intent_text="p2",
+        baseline_image_uri="baseline-2.png",
+        candidate_image_uri="candidate-2.png",
+        candidate_id=None,
+        system_prompt="latest-1",
+        baseline_system_prompt_snapshot="",
+        latest_system_prompt_snapshot="seed prompt",
+        prompt_category="outdoor_landscape",
+        selection_mode="keyword_fallback",
+        llm_score=None,
+        llm_reason=None,
+        generation_mode="text_only",
+        model_config={"m": 1},
+    )
+    cmp_b = store.add_comparison(
+        session_id=session_id,
+        prompt_text="p2",
+        left_image_uri="baseline-2.png",
+        right_image_uri="candidate-2.png",
+        winner="left",
+        critique="baseline better again",
+        outcome="winner",
+    )
+    store.mark_rollout_feedback_complete(rollout_b, cmp_b)
+    gate = store.get_gepa_gate_status(job_id)
+    assert gate["baseline_wins"] == 2
+    assert gate["candidate_wins"] == 0
+    assert gate["threshold"] == 3
+    assert gate["enabled"] is False
+
+    store.rollover_job_system_prompt(job_id, latest_system_prompt="optimized prompt")
+    rolled = store.get_aesthetic_job(job_id)
+    assert rolled is not None
+    assert rolled["baseline_system_prompt"] == "seed prompt"
+    assert rolled["latest_system_prompt"] == "optimized prompt"
+
+    store.archive_aesthetic_job(job_id)
+    assert store.get_aesthetic_job(job_id)["status"] == "archived"  # type: ignore[index]
