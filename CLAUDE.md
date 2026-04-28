@@ -50,8 +50,8 @@ The package lives in `src/image_preference_modelling/` with four layers:
 `intent_rewriter.py` — `PromptIntentRewriter` strips Midjourney tokens (e.g. `--ar`, `--v`, `--stylize`) and rewrites raw prompts into concise visual intents via an OpenRouter chat completion call. Input/output contract: raw prompt string → rewritten intent string, keyed by the original prompt text. The model is instructed to return strict JSON (`{"rewrites":[{"id":"<index>","intent":"..."}]}`); `parse_rewrite_payload` validates it. If coverage (fraction of prompts successfully rewritten) falls below `coverage_threshold`, the rewriter falls back to identity mapping and sets `used_fallback=True` so downstream stages can detect degraded quality.
 
 ### Storage (`storage/`)
-- `contracts.py` — type aliases (`RunType`, `RunStatus`, `RatingOutcome`) and `RunRecord` dataclass. `artifact_path()` is the canonical helper for locating run artifacts.
-- `state_store.py` — `StateStore` wraps SQLite at `.local/state/cockpit.db`. Four tables: `runs`, `rating_sessions`, `comparisons`, `run_events`. Every run also gets an artifact directory at `.local/artifacts/<run_id>/` containing `config.json` and a `job.log` written on completion.
+- `contracts.py` — shared type aliases (`RunType`, `RunStatus`, `RatingOutcome`) and canonical artifact directory helpers (`run_artifact_dir`, `rating_session_artifact_dir`).
+- `state_store.py` — `StateStore` wraps SQLite at `.local/state/cockpit.db`. Core tables include `runs`, `rating_sessions`, `comparisons`, and `run_events`, with typed run tables for generation/reward/gepa/evaluation metadata. Every run also gets an artifact directory at `.local/artifacts/<run_id>/` containing `config.json` and a `job.log` written on completion.
 
 Run status transitions are strictly enforced: `queued → running | cancelled`, `running → completed | failed | cancelled`. Terminal states have no outgoing transitions.
 
@@ -59,7 +59,13 @@ Run status transitions are strictly enforced: `queued → running | cancelled`, 
 `job_launcher.py` — `JobLauncher` dispatches runs onto a `ThreadPoolExecutor` (max 2 workers). The current `_execute_run` is a stub simulating work via `simulated_steps` / `simulated_step_seconds` config keys, or raising on `force_fail: true`. Real domain workers will replace this stub. Cancellation is cooperative: `cancel_run` sets a flag that the worker checks between steps.
 
 ### UI (`gradio_app.py`, `app_context.py`)
-`AppContext` is a frozen dataclass holding a `StateStore` and `JobLauncher`. `build_app(context)` accepts an injected context (useful for testing); `default_context()` builds from `.local/` in the working directory. Tabs: Overview metrics, Prompt Sets, Runs (create/dispatch/cancel/log), Review Queue (pairwise comparisons), Reward Model, Rewriter/GEPA, Evaluation.
+`AppContext` is a frozen dataclass holding a `StateStore` and `JobLauncher`. `build_app(context)` accepts an injected context (useful for testing); `default_context()` builds from `.local/` in the working directory.
+
+Current UI is a single image-preference workflow:
+- sample prompt from local prompt sources
+- generate baseline image
+- regenerate with edited reprompt + baseline image conditioning
+- submit winner + critique into a rating session in `StateStore`
 
 ### Local data
 All runtime state lives under `.local/` (gitignored). Tests use pytest's `tmp_path` fixture and never touch `.local/`.

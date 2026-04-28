@@ -10,6 +10,7 @@ from image_preference_modelling.config import ImageGenerationModelSettings
 from image_preference_modelling import generation_pipeline
 from image_preference_modelling.generation_pipeline import (
     GenerationDryRunOutputError,
+    build_regeneration_prompt,
     run_generation_dry_run,
 )
 
@@ -202,6 +203,16 @@ def test_sample_prompts_from_local_source_filters_and_samples_local_candidates(
     ]
 
 
+def test_build_regeneration_prompt_returns_system_prompt_only() -> None:
+    assert (
+        build_regeneration_prompt(
+            original_prompt="  A cinematic fox in a moonlit forest  ",
+            regeneration_instructions="  Improve lighting while preserving the composition.  ",
+        )
+        == "Improve lighting while preserving the composition."
+    )
+
+
 def test_run_generation_dry_run_loads_shared_image_settings(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -220,7 +231,7 @@ def test_run_generation_dry_run_loads_shared_image_settings(
     )
     monkeypatch.setattr(
         "image_preference_modelling.generation_pipeline.sample_prompts_from_local_source",
-        lambda prompt_source_root=Path("data/prompt_sources"), candidate_count=20, timeout_seconds=60.0: [
+        lambda prompt_source_root=Path("data/prompt_sources"), candidate_count=20, timeout_seconds=120.0: [
             "test prompt"
         ],
     )
@@ -229,21 +240,25 @@ def test_run_generation_dry_run_loads_shared_image_settings(
         prompt: str,
         settings: ImageGenerationModelSettings,
         *,
-        timeout_seconds: float = 60.0,
+        system_prompt: str | None = None,
+        timeout_seconds: float = 120.0,
     ) -> str:
         calls["prompt"] = prompt
+        calls["system_prompt"] = system_prompt
         calls["settings"] = settings
         calls["timeout_seconds"] = timeout_seconds
         return "data:image/png;base64,aGVsbG8="
 
     def _fake_refine_image(
-        prompt: str,
+        original_prompt: str,
+        regeneration_prompt: str,
         source_image_data_url: str,
         settings: ImageGenerationModelSettings,
         *,
-        timeout_seconds: float = 60.0,
+        timeout_seconds: float = 120.0,
     ) -> str:
-        calls["refine_prompt"] = prompt
+        calls["refine_original_prompt"] = original_prompt
+        calls["refine_prompt"] = regeneration_prompt
         calls["source_image_data_url"] = source_image_data_url
         calls["refine_settings"] = settings
         calls["refine_timeout_seconds"] = timeout_seconds
@@ -261,10 +276,19 @@ def test_run_generation_dry_run_loads_shared_image_settings(
     result = run_generation_dry_run(output_dir=tmp_path / "data")
 
     assert calls["prompt"] == "test prompt"
+    assert calls["system_prompt"] is None
     assert calls["settings"] == resolved_settings
-    assert calls["timeout_seconds"] == 60.0
+    assert calls["timeout_seconds"] == 120.0
     assert calls["refine_settings"] == resolved_settings
-    assert calls["refine_timeout_seconds"] == 60.0
+    assert calls["refine_timeout_seconds"] == 120.0
+    assert calls["refine_original_prompt"] == "test prompt"
+    assert calls["refine_prompt"] == build_regeneration_prompt(
+        original_prompt="test prompt",
+        regeneration_instructions=(
+            "Refine this image to better match the visual intent while preserving subject and composition. "
+            "Improve style, coherence, and detail without changing the core scene."
+        ),
+    )
     assert isinstance(calls["source_image_data_url"], str)
     assert str(calls["source_image_data_url"]).startswith("data:image/png;base64,")
     assert result.prompt == "test prompt"
@@ -298,6 +322,7 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
         prompt: str,
         settings: ImageGenerationModelSettings,
         *,
+        system_prompt: str | None = None,
         timeout_seconds: float = 60.0,
     ) -> str:
         attempted_prompts.append(prompt)
@@ -306,7 +331,8 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
         return "data:image/png;base64,aGVsbG8="
 
     def _fake_refine_image(
-        prompt: str,
+        original_prompt: str,
+        regeneration_prompt: str,
         source_image_data_url: str,
         settings: ImageGenerationModelSettings,
         *,
@@ -349,7 +375,7 @@ def test_generate_image_from_openrouter_requests_image_only_output(
             captured_payload,
             expected_url="https://openrouter.example/api/v1/chat/completions",
             expected_auth_header="Bearer secret",
-            expected_timeout=60.0,
+            expected_timeout=120.0,
         ),
     )
 
@@ -380,12 +406,13 @@ def test_generate_image_refinement_from_openrouter_sends_text_and_image_input(
             captured_payload,
             expected_url="https://openrouter.example/api/v1/chat/completions",
             expected_auth_header="Bearer secret",
-            expected_timeout=60.0,
+            expected_timeout=120.0,
         ),
     )
 
     image_data_url = generation_pipeline.generate_image_refinement_from_openrouter(
-        "Refine this image",
+        "A cinematic fox in a moonlit forest",
+        "Improve lighting while preserving the composition.",
         "data:image/png;base64,dGVzdA==",
         settings,
     )
@@ -394,11 +421,16 @@ def test_generate_image_refinement_from_openrouter_sends_text_and_image_input(
     assert captured_payload["modalities"] == ["image"]
     messages = captured_payload["messages"]
     assert isinstance(messages, list)
-    first_message = messages[0]
-    assert isinstance(first_message, dict)
-    content = first_message["content"]
+    assert messages[0] == {
+        "role": "system",
+        "content": "Improve lighting while preserving the composition.",
+    }
+    user_message = messages[1]
+    assert isinstance(user_message, dict)
+    assert user_message["role"] == "user"
+    content = user_message["content"]
     assert isinstance(content, list)
-    assert content[0] == {"type": "text", "text": "Refine this image"}
+    assert content[0] == {"type": "text", "text": "A cinematic fox in a moonlit forest"}
     assert content[1] == {
         "type": "image_url",
         "image_url": {"url": "data:image/png;base64,dGVzdA=="},

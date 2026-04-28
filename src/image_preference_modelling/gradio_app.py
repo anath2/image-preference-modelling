@@ -13,6 +13,7 @@ from image_preference_modelling.generation_pipeline import (
     DEFAULT_PROMPT_SOURCE_ROOT,
     DEFAULT_PROMPT_CANDIDATE_COUNT,
     DEFAULT_TIMEOUT_SECONDS,
+    build_regeneration_prompt,
     generate_image_from_openrouter,
     generate_image_refinement_from_openrouter,
     image_file_to_data_url,
@@ -332,8 +333,13 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
 
             settings = ImageGenerationModelSettings.from_env()
             source_image_data_url = image_file_to_data_url(baseline_image_path)
+            regeneration_prompt = build_regeneration_prompt(
+                original_prompt=cleaned_prompt,
+                regeneration_instructions=cleaned_reprompt,
+            )
             refined_data_url = generate_image_refinement_from_openrouter(
-                f"{cleaned_reprompt}\n\nOriginal prompt:\n{cleaned_prompt}",
+                cleaned_prompt,
+                regeneration_prompt,
                 source_image_data_url,
                 settings,
                 timeout_seconds=DEFAULT_TIMEOUT_SECONDS,

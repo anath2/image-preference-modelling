@@ -52,8 +52,8 @@ def _optimize_with_dspy_gepa(
         model=model_name,
         api_key=api_key,
         api_base=api_base.rstrip("/"),
-        temperature=0.3,
-        max_tokens=500,
+        temperature=0,
+        max_tokens=2048,
     )
     dspy.configure(lm=lm)
 

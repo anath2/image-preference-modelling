@@ -22,7 +22,7 @@ DEFAULT_HF_PROMPT_SPLIT = "train"
 DEFAULT_HF_PROMPT_COLUMN = "text"
 DEFAULT_PROMPT_SOURCE_ROOT = Path("data/prompt_sources")
 DEFAULT_PROMPT_CANDIDATE_COUNT = 20
-DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_TIMEOUT_SECONDS = 120.0
 _ALPHA_TOKEN_PATTERN = re.compile(r"[A-Za-z]{2,}")
 _IMAGE_MIME_BY_SUFFIX = {
     ".png": "image/png",
@@ -140,17 +140,23 @@ def generate_image_from_openrouter(
     prompt: str,
     settings: ImageGenerationModelSettings,
     *,
+    system_prompt: str | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
+    messages: list[dict[str, object]] = []
+    if system_prompt is not None:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
     return _post_openrouter_image_completion(
         settings=settings,
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         timeout_seconds=timeout_seconds,
     )
 
 
 def generate_image_refinement_from_openrouter(
-    prompt: str,
+    original_prompt: str,
+    regeneration_prompt: str,
     source_image_data_url: str,
     settings: ImageGenerationModelSettings,
     *,
@@ -159,16 +165,21 @@ def generate_image_refinement_from_openrouter(
     return _post_openrouter_image_completion(
         settings=settings,
         messages=[
+            {"role": "system", "content": regeneration_prompt},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": original_prompt},
                     {"type": "image_url", "image_url": {"url": source_image_data_url}},
                 ],
             }
         ],
         timeout_seconds=timeout_seconds,
     )
+
+
+def build_regeneration_prompt(*, original_prompt: str, regeneration_instructions: str) -> str:
+    return regeneration_instructions.strip()
 
 
 def _post_openrouter_image_completion(
@@ -185,6 +196,8 @@ def _post_openrouter_image_completion(
         "model": settings.image_model,
         "messages": messages,
         "modalities": ["image"],
+        "max_tokens": 2048,
+        "temperature": 0.7,
     }
 
     response = requests.post(
@@ -246,9 +259,13 @@ def run_generation_dry_run(
                 stem="online-dry-run-baseline",
             )
             source_image_data_url = image_file_to_data_url(baseline_image_path)
-            refined_prompt = f"{refinement_instruction}\n\nVisual intent:\n{prompt}"
+            refined_prompt = build_regeneration_prompt(
+                original_prompt=prompt,
+                regeneration_instructions=refinement_instruction,
+            )
             try:
                 refined_data_url = generate_image_refinement_from_openrouter(
+                    prompt,
                     refined_prompt,
                     source_image_data_url,
                     active_settings,
@@ -258,8 +275,9 @@ def run_generation_dry_run(
             except requests.RequestException:
                 # Some image models support image output but not image-conditioned input.
                 refined_data_url = generate_image_from_openrouter(
-                    refined_prompt,
+                    prompt,
                     active_settings,
+                    system_prompt=refined_prompt,
                     timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
                 )
                 used_image_conditioning = False
