@@ -58,7 +58,7 @@ def _optimize_with_dspy_gepa(
     dspy.configure(lm=lm)
 
     class PolicyRewrite(dspy.Signature):
-        """Improve an image refinement policy based on user feedback."""
+        """Improve a system prompt policy based on user feedback."""
 
         current_policy = dspy.InputField()
         feedback = dspy.InputField()
@@ -160,7 +160,7 @@ def run_gepa_optimization(
 
     n = float(len(rollouts))
     objective_means = {key: value / n for key, value in objective_totals.items()}
-    base_prompt = (job.get("compiled_gepa_prompt") or "").strip()
+    base_prompt = (job.get("latest_system_prompt") or job.get("compiled_system_prompt") or "").strip()
     optimizer_backend = str(config.get("optimizer_backend", "dspy_gepa")).strip() or "dspy_gepa"
     if optimizer_backend == "dspy_gepa":
         try:
@@ -173,10 +173,10 @@ def run_gepa_optimization(
             append_event("INFO", "DSPy GEPA optimization completed.")
         except Exception as exc:  # noqa: BLE001
             append_event("WARN", f"DSPy GEPA unavailable; falling back to heuristic policy update ({exc}).")
-            compiled_prompt = _build_compiled_prompt(job.get("compiled_gepa_prompt"), critiques)
+            compiled_prompt = _build_compiled_prompt(job.get("latest_system_prompt"), critiques)
             optimizer_backend = "heuristic_fallback"
     else:
-        compiled_prompt = _build_compiled_prompt(job.get("compiled_gepa_prompt"), critiques)
+        compiled_prompt = _build_compiled_prompt(job.get("latest_system_prompt"), critiques)
 
     parent_candidate_id = config.get("active_candidate_id") or job.get("active_candidate_id")
     parent_candidate_ids = [parent_candidate_id] if parent_candidate_id else []

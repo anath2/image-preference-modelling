@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import requests
 
-from image_preference_modelling.config import ImageGenerationModelSettings
+from image_preference_modelling.config import ImageGenerationModelSettings, PromptRewriteModelSettings
 
 
 class GenerationDryRunOutputError(ValueError):
@@ -23,14 +25,39 @@ DEFAULT_HF_PROMPT_COLUMN = "text"
 DEFAULT_PROMPT_SOURCE_ROOT = Path("data/prompt_sources")
 DEFAULT_PROMPT_CANDIDATE_COUNT = 20
 DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_JOB_IMAGE_ROOT = Path("data/jobs")
 _ALPHA_TOKEN_PATTERN = re.compile(r"[A-Za-z]{2,}")
-_IMAGE_MIME_BY_SUFFIX = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
+_PROMPT_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "portrait": ("portrait", "headshot", "face", "person", "woman", "man"),
+    "outdoor_landscape": (
+        "landscape",
+        "mountain",
+        "forest",
+        "valley",
+        "sunset",
+        "ocean",
+        "lake",
+        "outdoor",
+    ),
+    "cityscape": ("city", "street", "urban", "skyline", "architecture"),
 }
+_PROMPT_SELECTION_SYSTEM_INSTRUCTION = (
+    "You evaluate whether prompts match a target aesthetic brief.\n"
+    "Return JSON only with schema:\n"
+    '{"assessments":[{"id":"<index_as_string>","match":<true_or_false>,"score":<0_to_1>,"reason":"<short_reason>"}]}\n'
+    "Rules:\n"
+    "- score must be a number between 0 and 1.\n"
+    "- Keep reasons brief.\n"
+    "- No markdown or extra keys."
+)
+
+
+class PromptSelectionClientError(RuntimeError):
+    """Raised when LLM-guided prompt selection request fails."""
+
+
+class PromptSelectionOutputError(ValueError):
+    """Raised when LLM-guided prompt selection output is malformed."""
 _IMAGE_SUFFIX_BY_MIME = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -43,10 +70,9 @@ _IMAGE_SUFFIX_BY_MIME = {
 class GenerationDryRunResult:
     prompt: str
     baseline_image_path: Path
-    refined_image_path: Path
+    candidate_image_path: Path
     # Compatibility alias for legacy callers expecting a single output image.
     image_path: Path
-    used_image_conditioning: bool
 
 
 def ensure_prompt_source_parquet(
@@ -113,6 +139,194 @@ def sample_prompts_from_local_source(
     return random.sample(prompts, k=candidate_count)
 
 
+def sample_prompt_for_job(
+    *,
+    sampling_profile: dict[str, Any] | None,
+    job_description: str = "",
+    prompt_source_root: Path = DEFAULT_PROMPT_SOURCE_ROOT,
+    candidate_count: int = DEFAULT_PROMPT_CANDIDATE_COUNT,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> tuple[str, str | None, str, float | None, str | None]:
+    prompts = sample_prompts_from_local_source(
+        prompt_source_root=prompt_source_root,
+        candidate_count=candidate_count,
+        timeout_seconds=timeout_seconds,
+    )
+    selected_prompt, category, selection_mode, llm_score, llm_reason = pick_prompt_from_sampling_profile(
+        prompts,
+        sampling_profile=sampling_profile,
+        job_description=job_description,
+    )
+    return selected_prompt, category, selection_mode, llm_score, llm_reason
+
+
+def pick_prompt_from_sampling_profile(
+    prompts: list[str],
+    *,
+    sampling_profile: dict[str, Any] | None,
+    job_description: str = "",
+) -> tuple[str, str | None, str, float | None, str | None]:
+    if not prompts:
+        raise GenerationDryRunOutputError("Prompt source parquet did not contain usable prompts")
+    profile = sampling_profile or {}
+    requested_category = str(profile.get("category") or "").strip()
+    if bool(profile.get("llm_guided", True)):
+        try:
+            selected = _pick_prompt_with_llm_guidance(
+                prompts=prompts,
+                job_description=job_description,
+                requested_category=requested_category,
+                batch_size=int(profile.get("selection_batch_size", 100)),
+                min_match_score=float(profile.get("min_match_score", 0.7)),
+            )
+        except (PromptSelectionClientError, PromptSelectionOutputError):
+            selected = None
+        if selected is not None:
+            return (
+                selected["prompt"].strip(),
+                requested_category or None,
+                "llm_guided",
+                selected.get("score"),
+                selected.get("reason"),
+            )
+    if not requested_category:
+        return random.choice(prompts).strip(), None, "random_fallback", None, None
+    keywords = _PROMPT_CATEGORY_KEYWORDS.get(requested_category, ())
+    if not keywords:
+        return random.choice(prompts).strip(), requested_category, "random_fallback", None, None
+    filtered = [p for p in prompts if any(k in p.lower() for k in keywords)]
+    source = filtered if filtered else prompts
+    return random.choice(source).strip(), requested_category, "keyword_fallback", None, None
+
+
+def rollout_image_dir(job_id: str, rollout_id: str, *, image_root: Path = DEFAULT_JOB_IMAGE_ROOT) -> Path:
+    return image_root / job_id / "images" / rollout_id
+
+
+def _pick_prompt_with_llm_guidance(
+    *,
+    prompts: list[str],
+    job_description: str,
+    requested_category: str,
+    batch_size: int,
+    min_match_score: float,
+) -> dict[str, Any] | None:
+    if not prompts:
+        return None
+    try:
+        settings = PromptRewriteModelSettings.from_env()
+    except ValueError:
+        return None
+    sample_size = max(1, min(len(prompts), max(1, batch_size)))
+    prompt_batch = random.sample(prompts, k=sample_size) if len(prompts) > sample_size else list(prompts)
+    assessments = _assess_prompt_batch_with_llm(
+        prompts=prompt_batch,
+        job_description=job_description,
+        requested_category=requested_category,
+        settings=settings,
+    )
+    if not assessments:
+        return None
+    for assessment in assessments:
+        if assessment["match"] and assessment["score"] >= min_match_score:
+            return {
+                "prompt": prompt_batch[assessment["id"]],
+                "score": assessment["score"],
+                "reason": assessment.get("reason"),
+            }
+    best = max(assessments, key=lambda item: item["score"], default=None)
+    if best is None:
+        return None
+    return {
+        "prompt": prompt_batch[best["id"]],
+        "score": best["score"],
+        "reason": best.get("reason"),
+    }
+
+
+def _assess_prompt_batch_with_llm(
+    *,
+    prompts: list[str],
+    job_description: str,
+    requested_category: str,
+    settings: PromptRewriteModelSettings,
+    timeout_seconds: float = 30.0,
+) -> list[dict[str, Any]]:
+    headers = {
+        "Authorization": f"Bearer {settings.openrouter_api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.prompt_model,
+        "messages": [
+            {"role": "system", "content": _PROMPT_SELECTION_SYSTEM_INSTRUCTION},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "job_description": job_description.strip(),
+                        "prompt_category": requested_category.strip(),
+                        "prompts": [{"id": str(index), "text": prompt} for index, prompt in enumerate(prompts)],
+                    },
+                    ensure_ascii=True,
+                ),
+            },
+        ],
+        "temperature": 0,
+    }
+    try:
+        response = requests.post(
+            f"{settings.openrouter_base_url}/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise PromptSelectionClientError(f"Prompt selection request failed: {exc}") from exc
+    return _parse_prompt_selection_payload(response.json(), expected_count=len(prompts))
+
+
+def _parse_prompt_selection_payload(payload: dict[str, Any], *, expected_count: int) -> list[dict[str, Any]]:
+    try:
+        content = str(payload["choices"][0]["message"]["content"]).strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise PromptSelectionOutputError("Prompt selection response missing message content") from exc
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise PromptSelectionOutputError(f"Prompt selection response is not valid JSON: {exc}") from exc
+    assessments = decoded.get("assessments")
+    if not isinstance(assessments, list):
+        raise PromptSelectionOutputError("Prompt selection response must include assessments list")
+    parsed: list[dict[str, Any]] = []
+    for item in assessments:
+        if not isinstance(item, dict):
+            continue
+        idx_raw = item.get("id")
+        match = item.get("match")
+        score = item.get("score")
+        if not isinstance(idx_raw, str) or not idx_raw.isdigit():
+            continue
+        idx = int(idx_raw)
+        if idx < 0 or idx >= expected_count:
+            continue
+        if not isinstance(match, bool):
+            continue
+        if not isinstance(score, (int, float)):
+            continue
+        reason = item.get("reason")
+        parsed.append(
+            {
+                "id": idx,
+                "match": match,
+                "score": max(0.0, min(1.0, float(score))),
+                "reason": str(reason).strip() if isinstance(reason, str) else None,
+            }
+        )
+    return parsed
+
+
 def _discover_prompt_source_parquet_url(
     *,
     dataset: str,
@@ -154,31 +368,22 @@ def generate_image_from_openrouter(
     )
 
 
-def generate_image_refinement_from_openrouter(
+def generate_candidate_image_from_openrouter(
     original_prompt: str,
-    regeneration_prompt: str,
-    source_image_data_url: str,
+    system_prompt: str,
     settings: ImageGenerationModelSettings,
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
-    return _post_openrouter_image_completion(
+    return generate_image_from_openrouter(
+        original_prompt,
         settings=settings,
-        messages=[
-            {"role": "system", "content": regeneration_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": original_prompt},
-                    {"type": "image_url", "image_url": {"url": source_image_data_url}},
-                ],
-            }
-        ],
+        system_prompt=system_prompt,
         timeout_seconds=timeout_seconds,
     )
 
 
-def build_regeneration_prompt(*, original_prompt: str, regeneration_instructions: str) -> str:
+def build_candidate_system_prompt(*, original_prompt: str, regeneration_instructions: str) -> str:
     return regeneration_instructions.strip()
 
 
@@ -219,16 +424,6 @@ def save_generated_image(data_url: str, output_dir: Path, *, stem: str = "online
     return image_path
 
 
-def image_file_to_data_url(image_path: Path) -> str:
-    image_bytes = image_path.read_bytes()
-    if not image_bytes:
-        raise GenerationDryRunOutputError("Source image file was empty")
-    suffix = image_path.suffix.lower()
-    mime_type = _IMAGE_MIME_BY_SUFFIX.get(suffix, "image/png")
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
 def run_generation_dry_run(
     output_dir: Path,
     *,
@@ -258,40 +453,26 @@ def run_generation_dry_run(
                 output_dir,
                 stem="online-dry-run-baseline",
             )
-            source_image_data_url = image_file_to_data_url(baseline_image_path)
-            refined_prompt = build_regeneration_prompt(
+            candidate_system_prompt = build_candidate_system_prompt(
                 original_prompt=prompt,
                 regeneration_instructions=refinement_instruction,
             )
-            try:
-                refined_data_url = generate_image_refinement_from_openrouter(
-                    prompt,
-                    refined_prompt,
-                    source_image_data_url,
-                    active_settings,
-                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-                )
-                used_image_conditioning = True
-            except requests.RequestException:
-                # Some image models support image output but not image-conditioned input.
-                refined_data_url = generate_image_from_openrouter(
-                    prompt,
-                    active_settings,
-                    system_prompt=refined_prompt,
-                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-                )
-                used_image_conditioning = False
-            refined_image_path = save_generated_image(
-                refined_data_url,
+            candidate_data_url = generate_candidate_image_from_openrouter(
+                prompt,
+                candidate_system_prompt,
+                active_settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            )
+            candidate_image_path = save_generated_image(
+                candidate_data_url,
                 output_dir,
-                stem="online-dry-run-refined",
+                stem="online-dry-run-candidate",
             )
             return GenerationDryRunResult(
                 prompt=prompt,
                 baseline_image_path=baseline_image_path,
-                refined_image_path=refined_image_path,
-                image_path=refined_image_path,
-                used_image_conditioning=used_image_conditioning,
+                candidate_image_path=candidate_image_path,
+                image_path=candidate_image_path,
             )
         except GenerationDryRunOutputError as exc:
             last_failure = exc
