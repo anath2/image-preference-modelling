@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import random
 import os
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,8 @@ from image_preference_modelling.generation_pipeline import (
     build_candidate_system_prompt,
     generate_candidate_image_from_openrouter,
     generate_image_from_openrouter,
-    sample_prompts_from_local_source,
+    rollout_image_dir,
+    sample_prompt_for_job,
     save_generated_image,
 )
 
@@ -42,7 +44,7 @@ def _job_choices(jobs: list[dict[str, Any]]) -> list[tuple[str, str]]:
 
 
 def _resolve_active_system_prompt(job: dict[str, Any]) -> str:
-    return (job.get("compiled_system_prompt") or job["seed_system_prompt"]).strip()
+    return (job.get("latest_system_prompt") or job.get("compiled_system_prompt") or job["seed_system_prompt"]).strip()
 
 
 def _build_gepa_run_config(
@@ -76,6 +78,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         )
 
         prompt_state = gr.State(value="")
+        prompt_category_state = gr.State(value="")
+        prompt_selection_mode_state = gr.State(value="")
+        prompt_llm_score_state = gr.State(value="")
+        prompt_llm_reason_state = gr.State(value="")
         baseline_path_state = gr.State(value="")
         candidate_path_state = gr.State(value="")
         session_id_state = gr.State(value="")
@@ -91,10 +97,26 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             use_selected_job_btn = gr.Button("Use Selected Job")
         create_job_name = gr.Textbox(label="New Job Name")
         create_job_description = gr.Textbox(label="New Job Description")
-        create_job_seed_prompt = gr.Textbox(label="Seed Refinement Prompt")
+        create_job_seed_prompt = gr.Textbox(label="Seed System Prompt")
+        create_job_category = gr.Dropdown(
+            label="Guided Sampling Category",
+            choices=["portrait", "outdoor_landscape", "cityscape"],
+            value="portrait",
+        )
+        create_job_threshold = gr.Number(label="GEPA Enable Threshold", value=2, minimum=1, precision=0)
         create_job_btn = gr.Button("Create Job")
+        update_job_name = gr.Textbox(label="Update Job Name")
+        update_job_description = gr.Textbox(label="Update Job Description")
+        update_job_category = gr.Dropdown(
+            label="Update Sampling Category",
+            choices=["portrait", "outdoor_landscape", "cityscape"],
+            value="portrait",
+        )
+        update_job_threshold = gr.Number(label="Update GEPA Threshold", value=2, minimum=1, precision=0)
+        update_job_btn = gr.Button("Update Selected Job")
+        archive_job_btn = gr.Button("Archive Selected Job")
         active_job_name = gr.Textbox(label="Selected Job Name", interactive=False)
-        compiled_prompt_view = gr.Textbox(label="Compiled GEPA Prompt", interactive=False)
+        compiled_prompt_view = gr.Textbox(label="Latest System Prompt", interactive=False)
 
         with gr.Group(visible=False) as rollout_workflow_group:
             with gr.Row():
@@ -144,10 +166,34 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             jobs = ctx.state_store.list_aesthetic_jobs()
             return gr.update(choices=_job_choices(jobs)), "Job list refreshed."
 
-        def _create_job(name: str, description: str, seed_prompt: str) -> tuple[gr.Dropdown, str]:
+        def _gepa_button_state(job_id: str) -> tuple[Any, str]:
+            gate = ctx.state_store.get_gepa_gate_status(job_id)
+            message = (
+                f"GEPA enabled: baseline lead {gate['lead']} meets threshold {gate['threshold']}."
+                if gate["enabled"]
+                else (
+                    "GEPA disabled: baseline wins="
+                    f"{gate['baseline_wins']}, candidate wins={gate['candidate_wins']}, threshold={gate['threshold']}."
+                )
+            )
+            return gr.update(interactive=bool(gate["enabled"])), message
+
+        def _create_job(
+            name: str,
+            description: str,
+            seed_prompt: str,
+            category: str,
+            threshold: int | float,
+        ) -> tuple[gr.Dropdown, str]:
             if not name.strip() or not seed_prompt.strip():
                 return gr.update(), "Job name and seed system prompt are required."
-            ctx.state_store.create_aesthetic_job(name, description, seed_prompt)
+            ctx.state_store.create_aesthetic_job(
+                name,
+                description,
+                seed_prompt,
+                sampling_profile={"category": (category or "").strip()},
+                gepa_enable_threshold=int(threshold),
+            )
             jobs = ctx.state_store.list_aesthetic_jobs()
             return gr.update(choices=_job_choices(jobs)), "Aesthetic job created."
 
@@ -169,6 +215,32 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 str(completed_count),
             )
 
+        def _update_selected_job(
+            active_job_id: str,
+            name: str,
+            description: str,
+            category: str,
+            threshold: int | float,
+        ) -> tuple[str]:
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return ("Select and activate an aesthetic job first.",)
+            ctx.state_store.update_aesthetic_job(
+                selected_job_id,
+                name=name.strip() or None,
+                description=description.strip() or None,
+                sampling_profile={"category": (category or "").strip()},
+                gepa_enable_threshold=int(threshold),
+            )
+            return ("Selected job updated.",)
+
+        def _archive_selected_job(active_job_id: str) -> tuple[str, str]:
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return "", "Select and activate an aesthetic job first."
+            ctx.state_store.archive_aesthetic_job(selected_job_id)
+            return "", "Selected job archived."
+
         def _run_gepa_optimization(
             active_job_id: str,
             minibatch_value: int | float,
@@ -189,6 +261,19 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                     gr.update(active=False),
                 )
             completed_count = ctx.state_store.count_completed_rollouts_for_job(selected_job_id)
+            gate = ctx.state_store.get_gepa_gate_status(selected_job_id)
+            if not gate["enabled"]:
+                return (
+                    "No GEPA run yet.",
+                    str(completed_count),
+                    (
+                        "GEPA is disabled: baseline wins="
+                        f"{gate['baseline_wins']}, candidate wins={gate['candidate_wins']}, "
+                        f"threshold={gate['threshold']}."
+                    ),
+                    "",
+                    gr.update(active=False),
+                )
             if completed_count < chosen_minibatch:
                 return (
                     "No GEPA run yet.",
@@ -208,7 +293,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 minibatch_size=chosen_minibatch,
                 selected_rollout_ids=selected_rollout_ids,
                 active_candidate_id=job.get("active_candidate_id"),
-                compiled_prompt=job.get("compiled_system_prompt"),
+                compiled_prompt=job.get("latest_system_prompt") or job.get("compiled_system_prompt"),
             )
             run_id = ctx.state_store.create_run(
                 run_type="gepa",
@@ -245,7 +330,9 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 job = ctx.state_store.get_aesthetic_job(active_job)
                 if job is not None:
                     completed_count = str(ctx.state_store.count_completed_rollouts_for_job(active_job))
-                    compiled_prompt = str(job.get("compiled_system_prompt") or "")
+                    compiled_prompt = str(
+                        job.get("latest_system_prompt") or job.get("compiled_system_prompt") or ""
+                    )
                     system_prompt = _resolve_active_system_prompt(job)
             if status == "completed":
                 message = "GEPA run completed. Active job prompt refreshed."
@@ -280,14 +367,33 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             ]
             return "\n".join(lines), f"Showing logs for `{selected_run}`."
 
-        def _sample_prompt() -> tuple[str, str]:
-            prompts = sample_prompts_from_local_source(
+        def _sample_prompt(active_job_id: str) -> tuple[str, str, str, str, str, str]:
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return "", "", "", "", "", "Select and activate an aesthetic job first."
+            job = ctx.state_store.get_aesthetic_job(selected_job_id)
+            if job is None:
+                return "", "", "", "", "", "Selected job is unavailable."
+            selected, category, selection_mode, llm_score, llm_reason = sample_prompt_for_job(
+                sampling_profile=job.get("sampling_profile"),
+                job_description=str(job.get("description") or ""),
                 prompt_source_root=DEFAULT_PROMPT_SOURCE_ROOT,
                 candidate_count=DEFAULT_PROMPT_CANDIDATE_COUNT,
                 timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
-            selected = random.choice(prompts).strip()
-            return selected, "Prompt sampled. Click `Generate Baseline`."
+            message = (
+                f"Prompt sampled ({category}). Click `Generate Baseline`."
+                if category
+                else "Prompt sampled. Click `Generate Baseline`."
+            )
+            return (
+                selected,
+                category or "",
+                selection_mode,
+                "" if llm_score is None else str(llm_score),
+                llm_reason or "",
+                message,
+            )
 
         def _generate_baseline(prompt: str, active_job_id: str) -> tuple[str | None, str, str]:
             cleaned_prompt = prompt.strip()
@@ -316,6 +422,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         def _generate_candidate(
             prompt: str,
             reprompt: str,
+            prompt_category: str,
+            prompt_selection_mode: str,
+            prompt_llm_score: str,
+            prompt_llm_reason: str,
             baseline_path: str,
             active_job_id: str,
         ) -> tuple[str | None, str, str, str]:
@@ -335,6 +445,11 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 return None, "", "", "Baseline image file is missing. Generate baseline again."
 
             settings = ImageGenerationModelSettings.from_env()
+            rollout_id = f"rollout_{uuid.uuid4().hex[:10]}"
+            rollout_dir = rollout_image_dir(active_job_id.strip(), rollout_id)
+            rollout_dir.mkdir(parents=True, exist_ok=True)
+            preserved_baseline_path = rollout_dir / f"baseline{baseline_image_path.suffix.lower()}"
+            shutil.copy2(baseline_image_path, preserved_baseline_path)
             system_prompt = build_candidate_system_prompt(
                 original_prompt=cleaned_prompt,
                 regeneration_instructions=cleaned_reprompt,
@@ -347,17 +462,27 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             )
             candidate_path = save_generated_image(
                 candidate_data_url,
-                output_dir,
-                stem="ui-candidate",
+                rollout_dir,
+                stem="candidate",
             )
+            job = ctx.state_store.get_aesthetic_job(active_job_id.strip())
+            if job is None:
+                return None, "", "", "Selected job is unavailable."
             rollout_id = ctx.state_store.create_rollout(
+                rollout_id=rollout_id,
                 job_id=active_job_id.strip(),
                 prompt_text=cleaned_prompt,
                 intent_text=cleaned_prompt,
-                baseline_image_uri=str(baseline_image_path),
+                baseline_image_uri=str(preserved_baseline_path),
                 candidate_image_uri=str(candidate_path),
                 candidate_id=None,
                 system_prompt=system_prompt,
+                baseline_system_prompt_snapshot=str(job.get("baseline_system_prompt") or ""),
+                latest_system_prompt_snapshot=str(job.get("latest_system_prompt") or ""),
+                prompt_category=prompt_category.strip() or None,
+                selection_mode=prompt_selection_mode.strip() or None,
+                llm_score=float(prompt_llm_score) if prompt_llm_score.strip() else None,
+                llm_reason=prompt_llm_reason.strip() or None,
                 generation_mode="text_only",
                 model_config={"image_model": settings.image_model},
             )
@@ -427,7 +552,35 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         )
         create_job_btn.click(
             _create_job,
-            inputs=[create_job_name, create_job_description, create_job_seed_prompt],
+            inputs=[
+                create_job_name,
+                create_job_description,
+                create_job_seed_prompt,
+                create_job_category,
+                create_job_threshold,
+            ],
+            outputs=[selected_job, workflow_status],
+        )
+        update_job_btn.click(
+            _update_selected_job,
+            inputs=[
+                active_job_id_state,
+                update_job_name,
+                update_job_description,
+                update_job_category,
+                update_job_threshold,
+            ],
+            outputs=[workflow_status],
+        ).then(
+            _refresh_job_choices,
+            outputs=[selected_job, workflow_status],
+        )
+        archive_job_btn.click(
+            _archive_selected_job,
+            inputs=[active_job_id_state],
+            outputs=[active_job_id_state, workflow_status],
+        ).then(
+            _refresh_job_choices,
             outputs=[selected_job, workflow_status],
         )
         use_selected_job_btn.click(
@@ -442,6 +595,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 completed_feedback_count,
             ],
         ).then(
+            _gepa_button_state,
+            inputs=[active_job_id_state],
+            outputs=[run_gepa_btn, workflow_status],
+        ).then(
             lambda prompt: prompt,
             inputs=compiled_prompt_view,
             outputs=[reprompt_text],
@@ -452,7 +609,15 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
 
         sample_prompt_btn.click(
             _sample_prompt,
-            outputs=[sampled_prompt, workflow_status],
+            inputs=[active_job_id_state],
+            outputs=[
+                sampled_prompt,
+                prompt_category_state,
+                prompt_selection_mode_state,
+                prompt_llm_score_state,
+                prompt_llm_reason_state,
+                workflow_status,
+            ],
         ).then(
             lambda sampled: sampled,
             inputs=sampled_prompt,
@@ -467,7 +632,16 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
 
         generate_candidate_btn.click(
             _generate_candidate,
-            inputs=[sampled_prompt, reprompt_text, baseline_path_state, active_job_id_state],
+            inputs=[
+                sampled_prompt,
+                reprompt_text,
+                prompt_category_state,
+                prompt_selection_mode_state,
+                prompt_llm_score_state,
+                prompt_llm_reason_state,
+                baseline_path_state,
+                active_job_id_state,
+            ],
             outputs=[candidate_image, candidate_path_state, active_rollout_id_state, workflow_status],
         )
 
@@ -484,6 +658,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 active_job_id_state,
             ],
             outputs=[workflow_status, session_id_state, active_rollout_id_state, completed_feedback_count],
+        ).then(
+            _gepa_button_state,
+            inputs=[active_job_id_state],
+            outputs=[run_gepa_btn, workflow_status],
         )
 
         run_gepa_btn.click(
