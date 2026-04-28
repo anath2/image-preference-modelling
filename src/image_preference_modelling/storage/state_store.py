@@ -20,7 +20,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -29,6 +29,7 @@ VALID_RATING_OUTCOMES = {"winner", "both_good", "both_bad", "cant_decide"}
 VALID_AESTHETIC_JOB_STATUSES = {"active", "archived"}
 VALID_ROLLOUT_STATUSES = {"generated", "feedback_complete"}
 VALID_ROLLOUT_GENERATION_MODES = {"image_conditioned", "text_only"}
+DEFAULT_GEPA_ENABLE_THRESHOLD = 2
 
 
 class StateStore:
@@ -185,6 +186,10 @@ class StateStore:
                 description TEXT NOT NULL,
                 status TEXT NOT NULL,
                 seed_system_prompt TEXT NOT NULL,
+                baseline_system_prompt TEXT NOT NULL,
+                latest_system_prompt TEXT NOT NULL,
+                sampling_profile_json TEXT NOT NULL DEFAULT '{}',
+                gepa_enable_threshold INTEGER NOT NULL DEFAULT 2,
                 active_candidate_id TEXT,
                 compiled_system_prompt TEXT,
                 created_at TEXT NOT NULL,
@@ -201,6 +206,12 @@ class StateStore:
                 candidate_image_uri TEXT NOT NULL,
                 candidate_id TEXT,
                 system_prompt TEXT NOT NULL,
+                baseline_system_prompt_snapshot TEXT NOT NULL DEFAULT '',
+                latest_system_prompt_snapshot TEXT NOT NULL DEFAULT '',
+                prompt_category TEXT,
+                selection_mode TEXT,
+                llm_score REAL,
+                llm_reason TEXT,
                 generation_mode TEXT NOT NULL,
                 model_config_json TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -248,6 +259,14 @@ class StateStore:
         if current_version == 4:
             self._migrate_v4_to_v5(connection)
             current_version = 5
+
+        if current_version == 5:
+            self._migrate_v5_to_v6(connection)
+            current_version = 6
+
+        if current_version == 6:
+            self._migrate_v6_to_v7(connection)
+            current_version = 7
 
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
@@ -378,6 +397,65 @@ class StateStore:
             )
 
         self._set_schema_version(connection, 5)
+
+    def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
+        aesthetic_job_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(aesthetic_jobs)").fetchall()
+        }
+        if "baseline_system_prompt" not in aesthetic_job_columns:
+            connection.execute(
+                "ALTER TABLE aesthetic_jobs ADD COLUMN baseline_system_prompt TEXT NOT NULL DEFAULT ''"
+            )
+        if "latest_system_prompt" not in aesthetic_job_columns:
+            connection.execute(
+                "ALTER TABLE aesthetic_jobs ADD COLUMN latest_system_prompt TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                UPDATE aesthetic_jobs
+                SET latest_system_prompt = seed_system_prompt
+                WHERE latest_system_prompt = ''
+                """
+            )
+        if "sampling_profile_json" not in aesthetic_job_columns:
+            connection.execute(
+                "ALTER TABLE aesthetic_jobs ADD COLUMN sampling_profile_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "gepa_enable_threshold" not in aesthetic_job_columns:
+            connection.execute(
+                f"ALTER TABLE aesthetic_jobs ADD COLUMN gepa_enable_threshold INTEGER NOT NULL DEFAULT {DEFAULT_GEPA_ENABLE_THRESHOLD}"
+            )
+
+        rollout_columns = {row[1] for row in connection.execute("PRAGMA table_info(rollouts)").fetchall()}
+        if "baseline_system_prompt_snapshot" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN baseline_system_prompt_snapshot TEXT NOT NULL DEFAULT ''"
+            )
+        if "latest_system_prompt_snapshot" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN latest_system_prompt_snapshot TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET latest_system_prompt_snapshot = system_prompt
+                WHERE latest_system_prompt_snapshot = ''
+                """
+            )
+        if "prompt_category" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN prompt_category TEXT")
+
+        self._set_schema_version(connection, 6)
+
+    def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
+        rollout_columns = {row[1] for row in connection.execute("PRAGMA table_info(rollouts)").fetchall()}
+        if "selection_mode" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN selection_mode TEXT")
+        if "llm_score" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN llm_score REAL")
+        if "llm_reason" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN llm_reason TEXT")
+        self._set_schema_version(connection, 7)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -650,25 +728,39 @@ class StateStore:
             connection.commit()
         return comparison_id
 
-    def create_aesthetic_job(self, name: str, description: str, seed_system_prompt: str) -> str:
+    def create_aesthetic_job(
+        self,
+        name: str,
+        description: str,
+        seed_system_prompt: str,
+        *,
+        sampling_profile: dict[str, Any] | None = None,
+        gepa_enable_threshold: int = DEFAULT_GEPA_ENABLE_THRESHOLD,
+    ) -> str:
         job_id = f"job_{uuid.uuid4().hex[:10]}"
         created_at = _utc_now()
+        cleaned_seed = seed_system_prompt.strip()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO aesthetic_jobs (
-                    id, name, description, status, seed_system_prompt,
+                    id, name, description, status, seed_system_prompt, baseline_system_prompt,
+                    latest_system_prompt, sampling_profile_json, gepa_enable_threshold,
                     active_candidate_id, compiled_system_prompt, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     name.strip(),
                     description.strip(),
                     "active",
-                    seed_system_prompt.strip(),
+                    cleaned_seed,
+                    "",
+                    cleaned_seed,
+                    json.dumps(sampling_profile or {}),
+                    max(1, int(gepa_enable_threshold)),
                     None,
-                    None,
+                    cleaned_seed,
                     created_at,
                     created_at,
                 ),
@@ -684,7 +776,7 @@ class StateStore:
         )
         with self._connect() as connection:
             rows = connection.execute(query).fetchall()
-        return [dict(row) for row in rows]
+        return [self._hydrate_aesthetic_job(dict(row)) for row in rows]
 
     def get_aesthetic_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -692,7 +784,16 @@ class StateStore:
                 "SELECT * FROM aesthetic_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
-        return dict(row) if row else None
+        return self._hydrate_aesthetic_job(dict(row)) if row else None
+
+    def _hydrate_aesthetic_job(self, row: dict[str, Any]) -> dict[str, Any]:
+        profile = row.get("sampling_profile_json")
+        if isinstance(profile, str):
+            try:
+                row["sampling_profile"] = json.loads(profile)
+            except json.JSONDecodeError:
+                row["sampling_profile"] = {}
+        return row
 
     def update_aesthetic_job_policy(
         self, job_id: str, active_candidate_id: str | None, compiled_system_prompt: str | None
@@ -710,9 +811,83 @@ class StateStore:
             )
             connection.commit()
 
+    def update_aesthetic_job(
+        self,
+        job_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        sampling_profile: dict[str, Any] | None = None,
+        gepa_enable_threshold: int | None = None,
+    ) -> None:
+        if self.get_aesthetic_job(job_id) is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        assignments: list[str] = ["updated_at = ?"]
+        values: list[Any] = [_utc_now()]
+        if name is not None:
+            assignments.append("name = ?")
+            values.append(name.strip())
+        if description is not None:
+            assignments.append("description = ?")
+            values.append(description.strip())
+        if sampling_profile is not None:
+            assignments.append("sampling_profile_json = ?")
+            values.append(json.dumps(sampling_profile))
+        if gepa_enable_threshold is not None:
+            assignments.append("gepa_enable_threshold = ?")
+            values.append(max(1, int(gepa_enable_threshold)))
+        values.append(job_id)
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE aesthetic_jobs SET {', '.join(assignments)} WHERE id = ?",
+                tuple(values),
+            )
+            connection.commit()
+
+    def archive_aesthetic_job(self, job_id: str) -> None:
+        if self.get_aesthetic_job(job_id) is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE aesthetic_jobs SET status = 'archived', updated_at = ? WHERE id = ?",
+                (_utc_now(), job_id),
+            )
+            connection.commit()
+
+    def rollover_job_system_prompt(
+        self,
+        job_id: str,
+        *,
+        latest_system_prompt: str,
+        active_candidate_id: str | None = None,
+    ) -> None:
+        job = self.get_aesthetic_job(job_id)
+        if job is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        previous_latest = str(job.get("latest_system_prompt") or "")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE aesthetic_jobs
+                SET baseline_system_prompt = ?, latest_system_prompt = ?, compiled_system_prompt = ?,
+                    active_candidate_id = COALESCE(?, active_candidate_id), updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    previous_latest,
+                    latest_system_prompt.strip(),
+                    latest_system_prompt.strip(),
+                    active_candidate_id,
+                    _utc_now(),
+                    job_id,
+                ),
+            )
+            connection.commit()
+
     def create_rollout(
         self,
         *,
+        rollout_id: str | None = None,
         job_id: str,
         prompt_text: str,
         intent_text: str,
@@ -720,6 +895,12 @@ class StateStore:
         candidate_image_uri: str,
         candidate_id: str | None,
         system_prompt: str,
+        baseline_system_prompt_snapshot: str = "",
+        latest_system_prompt_snapshot: str = "",
+        prompt_category: str | None = None,
+        selection_mode: str | None = None,
+        llm_score: float | None = None,
+        llm_reason: str | None = None,
         generation_mode: str,
         model_config: dict[str, Any],
     ) -> str:
@@ -727,7 +908,7 @@ class StateStore:
             raise ValueError(f"Unsupported rollout generation_mode: {generation_mode}")
         if self.get_aesthetic_job(job_id) is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
-        rollout_id = f"rollout_{uuid.uuid4().hex[:10]}"
+        resolved_rollout_id = rollout_id or f"rollout_{uuid.uuid4().hex[:10]}"
         created_at = _utc_now()
         with self._connect() as connection:
             connection.execute(
@@ -735,11 +916,13 @@ class StateStore:
                 INSERT INTO rollouts (
                     id, job_id, comparison_id, prompt_text, intent_text,
                     baseline_image_uri, candidate_image_uri, candidate_id, system_prompt,
-                    generation_mode, model_config_json, status, created_at, feedback_completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    baseline_system_prompt_snapshot, latest_system_prompt_snapshot, prompt_category,
+                    selection_mode, llm_score, llm_reason, generation_mode,
+                    model_config_json, status, created_at, feedback_completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    rollout_id,
+                    resolved_rollout_id,
                     job_id,
                     None,
                     prompt_text,
@@ -748,6 +931,12 @@ class StateStore:
                     candidate_image_uri,
                     candidate_id,
                     system_prompt,
+                    baseline_system_prompt_snapshot,
+                    latest_system_prompt_snapshot,
+                    prompt_category,
+                    selection_mode,
+                    llm_score,
+                    llm_reason,
                     generation_mode,
                     json.dumps(model_config),
                     "generated",
@@ -756,7 +945,7 @@ class StateStore:
                 ),
             )
             connection.commit()
-        return rollout_id
+        return resolved_rollout_id
 
     def create_gepa_candidate(
         self,
@@ -850,15 +1039,57 @@ class StateStore:
                 raise ValueError(f"GEPA candidate {candidate_id} does not exist")
             if candidate["job_id"] != job_id:
                 raise ValueError("Cannot promote candidate for a different aesthetic job")
+            job_row = connection.execute(
+                "SELECT latest_system_prompt FROM aesthetic_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            previous_latest = str(job_row["latest_system_prompt"] if job_row else "")
             connection.execute(
                 """
                 UPDATE aesthetic_jobs
-                SET active_candidate_id = ?, compiled_system_prompt = ?, updated_at = ?
+                SET active_candidate_id = ?, compiled_system_prompt = ?, baseline_system_prompt = ?,
+                    latest_system_prompt = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (candidate_id, candidate["compiled_prompt"], _utc_now(), job_id),
+                (
+                    candidate_id,
+                    candidate["compiled_prompt"],
+                    previous_latest,
+                    candidate["compiled_prompt"],
+                    _utc_now(),
+                    job_id,
+                ),
             )
             connection.commit()
+
+    def get_gepa_gate_status(self, job_id: str) -> dict[str, Any]:
+        job = self.get_aesthetic_job(job_id)
+        if job is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        threshold = max(1, int(job.get("gepa_enable_threshold") or DEFAULT_GEPA_ENABLE_THRESHOLD))
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN c.outcome = 'winner' AND c.winner = 'left' THEN 1 ELSE 0 END) AS baseline_wins,
+                    SUM(CASE WHEN c.outcome = 'winner' AND c.winner = 'right' THEN 1 ELSE 0 END) AS candidate_wins
+                FROM rollouts r
+                JOIN comparisons c ON c.id = r.comparison_id
+                WHERE r.job_id = ? AND r.status = 'feedback_complete'
+                """,
+                (job_id,),
+            ).fetchone()
+        baseline_wins = int(row["baseline_wins"] or 0) if row else 0
+        candidate_wins = int(row["candidate_wins"] or 0) if row else 0
+        lead = baseline_wins - candidate_wins
+        enabled = baseline_wins > candidate_wins and lead >= threshold
+        return {
+            "baseline_wins": baseline_wins,
+            "candidate_wins": candidate_wins,
+            "threshold": threshold,
+            "enabled": enabled,
+            "lead": lead,
+        }
 
     def mark_rollout_feedback_complete(self, rollout_id: str, comparison_id: str) -> None:
         completed_at = _utc_now()
