@@ -6,7 +6,7 @@ import pytest
 from image_preference_modelling.app_context import AppContext
 from image_preference_modelling.gradio_app import (
     _build_gepa_run_config,
-    _resolve_active_refinement_prompt,
+    _resolve_active_system_prompt,
     _winner_to_storage_outcome,
     build_app,
 )
@@ -24,7 +24,7 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     store.create_aesthetic_job(
         name="test-job",
         description="test",
-        seed_refinement_prompt="seed policy",
+        seed_system_prompt="seed policy",
     )
     app = build_app(AppContext(state_store=store, job_launcher=JobLauncher(store)))
 
@@ -44,7 +44,7 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
 
     assert "Sample Prompt" in buttons
     assert "Generate Baseline" in buttons
-    assert "Regenerate" in buttons
+    assert "Generate Candidate" in buttons
     assert "Submit Score" in buttons
     assert "Create Job" in buttons
     assert "Use Selected Job" in buttons
@@ -62,12 +62,12 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Latest GEPA Run Status" in labels
     assert "GEPA Run Logs" in labels
     assert "Sampled Prompt" in labels
-    assert "Active Refinement Prompt" in labels
+    assert "Active System Prompt" in labels
     assert "Baseline" in labels
-    assert "Regenerated" in labels
+    assert "Candidate" in labels
     assert tuple(choice[0] for choice in winner_radio.choices) == (
         "baseline",
-        "regenerated",
+        "candidate",
         "both_good",
         "both_bad",
         "cant_decide",
@@ -78,7 +78,7 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     ("winner", "expected"),
     [
         ("baseline", ("left", "winner")),
-        ("regenerated", ("right", "winner")),
+        ("candidate", ("right", "winner")),
         ("both_good", (None, "both_good")),
         ("both_bad", (None, "both_bad")),
         ("cant_decide", (None, "cant_decide")),
@@ -102,21 +102,21 @@ def test_build_gepa_run_config_includes_job_and_minibatch() -> None:
     assert config["optimizer_backend"] == "dspy_gepa"
 
 
-def test_resolve_active_refinement_prompt_prefers_compiled_prompt() -> None:
+def test_resolve_active_system_prompt_prefers_compiled_prompt() -> None:
     assert (
-        _resolve_active_refinement_prompt(
+        _resolve_active_system_prompt(
             {
-                "seed_refinement_prompt": "seed prompt",
-                "compiled_gepa_prompt": "compiled prompt",
+                "seed_system_prompt": "seed prompt",
+                "compiled_system_prompt": "compiled prompt",
             }
         )
         == "compiled prompt"
     )
     assert (
-        _resolve_active_refinement_prompt(
+        _resolve_active_system_prompt(
             {
-                "seed_refinement_prompt": "seed prompt",
-                "compiled_gepa_prompt": "",
+                "seed_system_prompt": "seed prompt",
+                "compiled_system_prompt": "",
             }
         )
         == "seed prompt"

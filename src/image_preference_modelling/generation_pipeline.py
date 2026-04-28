@@ -24,13 +24,6 @@ DEFAULT_PROMPT_SOURCE_ROOT = Path("data/prompt_sources")
 DEFAULT_PROMPT_CANDIDATE_COUNT = 20
 DEFAULT_TIMEOUT_SECONDS = 120.0
 _ALPHA_TOKEN_PATTERN = re.compile(r"[A-Za-z]{2,}")
-_IMAGE_MIME_BY_SUFFIX = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-}
 _IMAGE_SUFFIX_BY_MIME = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -43,10 +36,9 @@ _IMAGE_SUFFIX_BY_MIME = {
 class GenerationDryRunResult:
     prompt: str
     baseline_image_path: Path
-    refined_image_path: Path
+    candidate_image_path: Path
     # Compatibility alias for legacy callers expecting a single output image.
     image_path: Path
-    used_image_conditioning: bool
 
 
 def ensure_prompt_source_parquet(
@@ -154,31 +146,22 @@ def generate_image_from_openrouter(
     )
 
 
-def generate_image_refinement_from_openrouter(
+def generate_candidate_image_from_openrouter(
     original_prompt: str,
-    regeneration_prompt: str,
-    source_image_data_url: str,
+    system_prompt: str,
     settings: ImageGenerationModelSettings,
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> str:
-    return _post_openrouter_image_completion(
+    return generate_image_from_openrouter(
+        original_prompt,
         settings=settings,
-        messages=[
-            {"role": "system", "content": regeneration_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": original_prompt},
-                    {"type": "image_url", "image_url": {"url": source_image_data_url}},
-                ],
-            }
-        ],
+        system_prompt=system_prompt,
         timeout_seconds=timeout_seconds,
     )
 
 
-def build_regeneration_prompt(*, original_prompt: str, regeneration_instructions: str) -> str:
+def build_candidate_system_prompt(*, original_prompt: str, regeneration_instructions: str) -> str:
     return regeneration_instructions.strip()
 
 
@@ -219,16 +202,6 @@ def save_generated_image(data_url: str, output_dir: Path, *, stem: str = "online
     return image_path
 
 
-def image_file_to_data_url(image_path: Path) -> str:
-    image_bytes = image_path.read_bytes()
-    if not image_bytes:
-        raise GenerationDryRunOutputError("Source image file was empty")
-    suffix = image_path.suffix.lower()
-    mime_type = _IMAGE_MIME_BY_SUFFIX.get(suffix, "image/png")
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
-
-
 def run_generation_dry_run(
     output_dir: Path,
     *,
@@ -258,40 +231,26 @@ def run_generation_dry_run(
                 output_dir,
                 stem="online-dry-run-baseline",
             )
-            source_image_data_url = image_file_to_data_url(baseline_image_path)
-            refined_prompt = build_regeneration_prompt(
+            candidate_system_prompt = build_candidate_system_prompt(
                 original_prompt=prompt,
                 regeneration_instructions=refinement_instruction,
             )
-            try:
-                refined_data_url = generate_image_refinement_from_openrouter(
-                    prompt,
-                    refined_prompt,
-                    source_image_data_url,
-                    active_settings,
-                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-                )
-                used_image_conditioning = True
-            except requests.RequestException:
-                # Some image models support image output but not image-conditioned input.
-                refined_data_url = generate_image_from_openrouter(
-                    prompt,
-                    active_settings,
-                    system_prompt=refined_prompt,
-                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-                )
-                used_image_conditioning = False
-            refined_image_path = save_generated_image(
-                refined_data_url,
+            candidate_data_url = generate_candidate_image_from_openrouter(
+                prompt,
+                candidate_system_prompt,
+                active_settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            )
+            candidate_image_path = save_generated_image(
+                candidate_data_url,
                 output_dir,
-                stem="online-dry-run-refined",
+                stem="online-dry-run-candidate",
             )
             return GenerationDryRunResult(
                 prompt=prompt,
                 baseline_image_path=baseline_image_path,
-                refined_image_path=refined_image_path,
-                image_path=refined_image_path,
-                used_image_conditioning=used_image_conditioning,
+                candidate_image_path=candidate_image_path,
+                image_path=candidate_image_path,
             )
         except GenerationDryRunOutputError as exc:
             last_failure = exc

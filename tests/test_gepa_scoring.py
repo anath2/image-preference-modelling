@@ -5,7 +5,7 @@ def _rollout(outcome: str, winner: str | None, critique: str) -> dict[str, str |
     return {"outcome": outcome, "winner": winner, "critique": critique}
 
 
-def test_score_rollout_feedback_regenerated_win() -> None:
+def test_score_rollout_feedback_candidate_win() -> None:
     scores = score_rollout_feedback(
         _rollout("winner", "right", "Great lighting and composition improvements.")
     )

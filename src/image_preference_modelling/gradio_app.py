@@ -13,10 +13,9 @@ from image_preference_modelling.generation_pipeline import (
     DEFAULT_PROMPT_SOURCE_ROOT,
     DEFAULT_PROMPT_CANDIDATE_COUNT,
     DEFAULT_TIMEOUT_SECONDS,
-    build_regeneration_prompt,
+    build_candidate_system_prompt,
+    generate_candidate_image_from_openrouter,
     generate_image_from_openrouter,
-    generate_image_refinement_from_openrouter,
-    image_file_to_data_url,
     sample_prompts_from_local_source,
     save_generated_image,
 )
@@ -31,7 +30,7 @@ def _workflow_output_dir() -> Path:
 def _winner_to_storage_outcome(winner: str) -> tuple[str | None, str]:
     if winner == "baseline":
         return "left", "winner"
-    if winner == "regenerated":
+    if winner == "candidate":
         return "right", "winner"
     if winner in {"both_good", "both_bad", "cant_decide"}:
         return None, winner
@@ -42,8 +41,8 @@ def _job_choices(jobs: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return [(f"{job['name']} ({job['id']})", job["id"]) for job in jobs]
 
 
-def _resolve_active_refinement_prompt(job: dict[str, Any]) -> str:
-    return (job.get("compiled_gepa_prompt") or job["seed_refinement_prompt"]).strip()
+def _resolve_active_system_prompt(job: dict[str, Any]) -> str:
+    return (job.get("compiled_system_prompt") or job["seed_system_prompt"]).strip()
 
 
 def _build_gepa_run_config(
@@ -73,16 +72,16 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
     with gr.Blocks(title="Gradio Operator Cockpit") as app:
         gr.Markdown("# Image Preference Workflow")
         gr.Markdown(
-            "Sample a prompt, generate baseline image, edit reprompt, regenerate, then score the winner."
+            "Sample a prompt, generate baseline image, apply active system prompt to generate a candidate, then score."
         )
 
         prompt_state = gr.State(value="")
         baseline_path_state = gr.State(value="")
-        regenerated_path_state = gr.State(value="")
+        candidate_path_state = gr.State(value="")
         session_id_state = gr.State(value="")
         active_job_id_state = gr.State(value="")
         active_rollout_id_state = gr.State(value="")
-        active_refinement_prompt_state = gr.State(value="")
+        active_system_prompt_state = gr.State(value="")
         latest_gepa_run_id_state = gr.State(value="")
 
         gr.Markdown("## Aesthetic Job")
@@ -101,17 +100,17 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             with gr.Row():
                 sample_prompt_btn = gr.Button("Sample Prompt")
                 generate_baseline_btn = gr.Button("Generate Baseline")
-                regenerate_btn = gr.Button("Regenerate")
+                generate_candidate_btn = gr.Button("Generate Candidate")
 
             sampled_prompt = gr.Textbox(label="Sampled Prompt", interactive=False)
-            reprompt_text = gr.Textbox(label="Active Refinement Prompt", interactive=False)
+            reprompt_text = gr.Textbox(label="Active System Prompt", interactive=False)
 
             with gr.Row():
                 baseline_image = gr.Image(label="Baseline", type="filepath")
-                regenerated_image = gr.Image(label="Regenerated", type="filepath")
+                candidate_image = gr.Image(label="Candidate", type="filepath")
 
             winner_choice = gr.Radio(
-                choices=["baseline", "regenerated", "both_good", "both_bad", "cant_decide"],
+                choices=["baseline", "candidate", "both_good", "both_bad", "cant_decide"],
                 value="cant_decide",
                 label="Winner",
             )
@@ -147,7 +146,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
 
         def _create_job(name: str, description: str, seed_prompt: str) -> tuple[gr.Dropdown, str]:
             if not name.strip() or not seed_prompt.strip():
-                return gr.update(), "Job name and seed refinement prompt are required."
+                return gr.update(), "Job name and seed system prompt are required."
             ctx.state_store.create_aesthetic_job(name, description, seed_prompt)
             jobs = ctx.state_store.list_aesthetic_jobs()
             return gr.update(choices=_job_choices(jobs)), "Aesthetic job created."
@@ -159,7 +158,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             job = ctx.state_store.get_aesthetic_job(selected)
             if job is None or job["status"] != "active":
                 return "", "", "", "Selected job is unavailable.", gr.update(visible=False), "0"
-            active_prompt = _resolve_active_refinement_prompt(job)
+            active_prompt = _resolve_active_system_prompt(job)
             completed_count = ctx.state_store.count_completed_rollouts_for_job(selected)
             return (
                 selected,
@@ -209,7 +208,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 minibatch_size=chosen_minibatch,
                 selected_rollout_ids=selected_rollout_ids,
                 active_candidate_id=job.get("active_candidate_id"),
-                compiled_prompt=job.get("compiled_gepa_prompt"),
+                compiled_prompt=job.get("compiled_system_prompt"),
             )
             run_id = ctx.state_store.create_run(
                 run_type="gepa",
@@ -241,13 +240,13 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             status_text = f"{run['id']} ({status})"
             completed_count = "0"
             compiled_prompt = ""
-            refinement_prompt = ""
+            system_prompt = ""
             if active_job:
                 job = ctx.state_store.get_aesthetic_job(active_job)
                 if job is not None:
                     completed_count = str(ctx.state_store.count_completed_rollouts_for_job(active_job))
-                    compiled_prompt = str(job.get("compiled_gepa_prompt") or "")
-                    refinement_prompt = _resolve_active_refinement_prompt(job)
+                    compiled_prompt = str(job.get("compiled_system_prompt") or "")
+                    system_prompt = _resolve_active_system_prompt(job)
             if status == "completed":
                 message = "GEPA run completed. Active job prompt refreshed."
                 timer_update = gr.update(active=False)
@@ -263,7 +262,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             else:
                 message = f"GEPA run is {status}. Refresh again shortly."
                 timer_update = gr.update(active=True)
-            return status_text, completed_count, message, compiled_prompt, refinement_prompt, timer_update
+            return status_text, completed_count, message, compiled_prompt, system_prompt, timer_update
 
         def _show_gepa_logs(run_id: str) -> tuple[str, str]:
             selected_run = run_id.strip()
@@ -308,9 +307,13 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 output_dir,
                 stem="ui-baseline",
             )
-            return str(baseline_path), str(baseline_path), "Baseline generated. Edit reprompt and click `Regenerate`."
+            return (
+                str(baseline_path),
+                str(baseline_path),
+                "Baseline generated. Confirm the active system prompt and click `Generate Candidate`.",
+            )
 
-        def _regenerate(
+        def _generate_candidate(
             prompt: str,
             reprompt: str,
             baseline_path: str,
@@ -321,55 +324,54 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             if not cleaned_prompt:
                 return None, "", "", "Sample a prompt first."
             if not baseline_path.strip():
-                return None, "", "", "Generate baseline first."
+                return None, "", "", "Generate baseline first for side-by-side comparison."
             if not active_job_id.strip():
                 return None, "", "", "Select and activate an aesthetic job first."
             if not cleaned_reprompt:
-                return None, "", "", "Refinement prompt is required."
+                return None, "", "", "System prompt is required."
 
             baseline_image_path = Path(baseline_path)
             if not baseline_image_path.exists():
-                return None, "", "", "Baseline image file is missing. Regenerate baseline."
+                return None, "", "", "Baseline image file is missing. Generate baseline again."
 
             settings = ImageGenerationModelSettings.from_env()
-            source_image_data_url = image_file_to_data_url(baseline_image_path)
-            regeneration_prompt = build_regeneration_prompt(
+            system_prompt = build_candidate_system_prompt(
                 original_prompt=cleaned_prompt,
                 regeneration_instructions=cleaned_reprompt,
             )
-            refined_data_url = generate_image_refinement_from_openrouter(
+            candidate_data_url = generate_candidate_image_from_openrouter(
                 cleaned_prompt,
-                regeneration_prompt,
-                source_image_data_url,
+                system_prompt,
                 settings,
                 timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
-            regenerated_path = save_generated_image(
-                refined_data_url,
+            candidate_path = save_generated_image(
+                candidate_data_url,
                 output_dir,
-                stem="ui-regenerated",
+                stem="ui-candidate",
             )
             rollout_id = ctx.state_store.create_rollout(
                 job_id=active_job_id.strip(),
                 prompt_text=cleaned_prompt,
                 intent_text=cleaned_prompt,
                 baseline_image_uri=str(baseline_image_path),
-                refined_image_uri=str(regenerated_path),
+                candidate_image_uri=str(candidate_path),
                 candidate_id=None,
-                refinement_prompt=cleaned_reprompt,
+                system_prompt=system_prompt,
+                generation_mode="text_only",
                 model_config={"image_model": settings.image_model},
             )
             return (
-                str(regenerated_path),
-                str(regenerated_path),
+                str(candidate_path),
+                str(candidate_path),
                 rollout_id,
-                "Regenerated image ready. Pick winner and submit score.",
+                "Candidate image ready. Pick winner and submit score.",
             )
 
         def _submit_score(
             prompt: str,
             baseline_path: str,
-            regenerated_path: str,
+            candidate_path: str,
             winner: str,
             critique: str,
             session_id: str,
@@ -378,20 +380,20 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         ) -> tuple[str, str, str, str]:
             cleaned_prompt = prompt.strip()
             left_uri = baseline_path.strip()
-            right_uri = regenerated_path.strip()
+            right_uri = candidate_path.strip()
             if not cleaned_prompt:
                 return "Prompt is required before scoring.", session_id, active_rollout_id, "0"
             if not left_uri or not right_uri:
                 return (
-                    "Generate both baseline and regenerated images before scoring.",
+                    "Generate both baseline and candidate images before scoring.",
                     session_id,
                     active_rollout_id,
                     "0",
                 )
             if left_uri == right_uri:
-                return "Baseline and regenerated image URIs must differ.", session_id, active_rollout_id, "0"
+                return "Baseline and candidate image URIs must differ.", session_id, active_rollout_id, "0"
             if not active_rollout_id.strip():
-                return "Regenerate an image to create a rollout before scoring.", session_id, active_rollout_id, "0"
+                return "Generate a candidate image to create a rollout before scoring.", session_id, active_rollout_id, "0"
             if not critique.strip():
                 return "Critique is required before scoring.", session_id, active_rollout_id, "0"
 
@@ -463,10 +465,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             outputs=[baseline_image, baseline_path_state, workflow_status],
         )
 
-        regenerate_btn.click(
-            _regenerate,
+        generate_candidate_btn.click(
+            _generate_candidate,
             inputs=[sampled_prompt, reprompt_text, baseline_path_state, active_job_id_state],
-            outputs=[regenerated_image, regenerated_path_state, active_rollout_id_state, workflow_status],
+            outputs=[candidate_image, candidate_path_state, active_rollout_id_state, workflow_status],
         )
 
         submit_score_btn.click(
@@ -474,7 +476,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             inputs=[
                 prompt_state,
                 baseline_path_state,
-                regenerated_path_state,
+                candidate_path_state,
                 winner_choice,
                 critique_text,
                 session_id_state,

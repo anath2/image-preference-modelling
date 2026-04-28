@@ -9,8 +9,8 @@ import pytest
 from image_preference_modelling.config import ImageGenerationModelSettings
 from image_preference_modelling import generation_pipeline
 from image_preference_modelling.generation_pipeline import (
+    build_candidate_system_prompt,
     GenerationDryRunOutputError,
-    build_regeneration_prompt,
     run_generation_dry_run,
 )
 
@@ -203,9 +203,9 @@ def test_sample_prompts_from_local_source_filters_and_samples_local_candidates(
     ]
 
 
-def test_build_regeneration_prompt_returns_system_prompt_only() -> None:
+def test_build_candidate_system_prompt_returns_system_prompt_only() -> None:
     assert (
-        build_regeneration_prompt(
+        build_candidate_system_prompt(
             original_prompt="  A cinematic fox in a moonlit forest  ",
             regeneration_instructions="  Improve lighting while preserving the composition.  ",
         )
@@ -249,19 +249,17 @@ def test_run_generation_dry_run_loads_shared_image_settings(
         calls["timeout_seconds"] = timeout_seconds
         return "data:image/png;base64,aGVsbG8="
 
-    def _fake_refine_image(
+    def _fake_generate_candidate(
         original_prompt: str,
-        regeneration_prompt: str,
-        source_image_data_url: str,
+        system_prompt: str,
         settings: ImageGenerationModelSettings,
         *,
         timeout_seconds: float = 120.0,
     ) -> str:
-        calls["refine_original_prompt"] = original_prompt
-        calls["refine_prompt"] = regeneration_prompt
-        calls["source_image_data_url"] = source_image_data_url
-        calls["refine_settings"] = settings
-        calls["refine_timeout_seconds"] = timeout_seconds
+        calls["candidate_original_prompt"] = original_prompt
+        calls["candidate_system_prompt"] = system_prompt
+        calls["candidate_settings"] = settings
+        calls["candidate_timeout_seconds"] = timeout_seconds
         return "data:image/png;base64,d29ybGQ="
 
     monkeypatch.setattr(
@@ -269,8 +267,8 @@ def test_run_generation_dry_run_loads_shared_image_settings(
         _fake_generate_image,
     )
     monkeypatch.setattr(
-        "image_preference_modelling.generation_pipeline.generate_image_refinement_from_openrouter",
-        _fake_refine_image,
+        "image_preference_modelling.generation_pipeline.generate_candidate_image_from_openrouter",
+        _fake_generate_candidate,
     )
 
     result = run_generation_dry_run(output_dir=tmp_path / "data")
@@ -279,23 +277,21 @@ def test_run_generation_dry_run_loads_shared_image_settings(
     assert calls["system_prompt"] is None
     assert calls["settings"] == resolved_settings
     assert calls["timeout_seconds"] == 120.0
-    assert calls["refine_settings"] == resolved_settings
-    assert calls["refine_timeout_seconds"] == 120.0
-    assert calls["refine_original_prompt"] == "test prompt"
-    assert calls["refine_prompt"] == build_regeneration_prompt(
+    assert calls["candidate_settings"] == resolved_settings
+    assert calls["candidate_timeout_seconds"] == 120.0
+    assert calls["candidate_original_prompt"] == "test prompt"
+    assert calls["candidate_system_prompt"] == build_candidate_system_prompt(
         original_prompt="test prompt",
         regeneration_instructions=(
             "Refine this image to better match the visual intent while preserving subject and composition. "
             "Improve style, coherence, and detail without changing the core scene."
         ),
     )
-    assert isinstance(calls["source_image_data_url"], str)
-    assert str(calls["source_image_data_url"]).startswith("data:image/png;base64,")
     assert result.prompt == "test prompt"
     assert result.image_path.exists()
     assert result.baseline_image_path.exists()
-    assert result.refined_image_path.exists()
-    assert result.image_path == result.refined_image_path
+    assert result.candidate_image_path.exists()
+    assert result.image_path == result.candidate_image_path
     assert result.image_path.parent == tmp_path / "data"
 
 
@@ -330,10 +326,9 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
             raise GenerationDryRunOutputError("OpenRouter response missing images")
         return "data:image/png;base64,aGVsbG8="
 
-    def _fake_refine_image(
+    def _fake_generate_candidate(
         original_prompt: str,
-        regeneration_prompt: str,
-        source_image_data_url: str,
+        system_prompt: str,
         settings: ImageGenerationModelSettings,
         *,
         timeout_seconds: float = 60.0,
@@ -345,8 +340,8 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
         _fake_generate_image,
     )
     monkeypatch.setattr(
-        "image_preference_modelling.generation_pipeline.generate_image_refinement_from_openrouter",
-        _fake_refine_image,
+        "image_preference_modelling.generation_pipeline.generate_candidate_image_from_openrouter",
+        _fake_generate_candidate,
     )
 
     result = run_generation_dry_run(output_dir=tmp_path / "data", settings=settings)
@@ -355,7 +350,7 @@ def test_run_generation_dry_run_tries_next_candidate_after_payload_failure(
     assert result.prompt == "successful candidate"
     assert result.image_path.exists()
     assert result.baseline_image_path.exists()
-    assert result.refined_image_path.exists()
+    assert result.candidate_image_path.exists()
 
 
 def test_generate_image_from_openrouter_requests_image_only_output(
@@ -389,7 +384,7 @@ def test_generate_image_from_openrouter_requests_image_only_output(
     assert image_data_url == "data:image/png;base64,aGVsbG8="
 
 
-def test_generate_image_refinement_from_openrouter_sends_text_and_image_input(
+def test_generate_candidate_image_from_openrouter_sends_text_only_messages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = ImageGenerationModelSettings(
@@ -410,10 +405,9 @@ def test_generate_image_refinement_from_openrouter_sends_text_and_image_input(
         ),
     )
 
-    image_data_url = generation_pipeline.generate_image_refinement_from_openrouter(
+    image_data_url = generation_pipeline.generate_candidate_image_from_openrouter(
         "A cinematic fox in a moonlit forest",
         "Improve lighting while preserving the composition.",
-        "data:image/png;base64,dGVzdA==",
         settings,
     )
 
@@ -428,11 +422,5 @@ def test_generate_image_refinement_from_openrouter_sends_text_and_image_input(
     user_message = messages[1]
     assert isinstance(user_message, dict)
     assert user_message["role"] == "user"
-    content = user_message["content"]
-    assert isinstance(content, list)
-    assert content[0] == {"type": "text", "text": "A cinematic fox in a moonlit forest"}
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,dGVzdA=="},
-    }
+    assert user_message["content"] == "A cinematic fox in a moonlit forest"
     assert image_data_url == "data:image/png;base64,aGVsbG8="

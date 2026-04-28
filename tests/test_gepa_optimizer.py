@@ -22,16 +22,17 @@ def _create_completed_rollout(
         prompt_text=prompt,
         intent_text=prompt,
         baseline_image_uri=f"{prompt}-baseline.png",
-        refined_image_uri=f"{prompt}-refined.png",
+        candidate_image_uri=f"{prompt}-candidate.png",
         candidate_id=None,
-        refinement_prompt="Refine carefully.",
+        system_prompt="Refine carefully.",
+        generation_mode="text_only",
         model_config={"image_model": "test-model"},
     )
     comparison_id = store.add_comparison(
         session_id=session_id,
         prompt_text=prompt,
         left_image_uri=f"{prompt}-baseline.png",
-        right_image_uri=f"{prompt}-refined.png",
+        right_image_uri=f"{prompt}-candidate.png",
         winner=winner,
         critique=critique,
         outcome=outcome,  # type: ignore[arg-type]
@@ -45,7 +46,7 @@ def test_run_gepa_optimization_writes_checkpoint_and_promotes_candidate(tmp_path
     job_id = store.create_aesthetic_job(
         name="cinematic",
         description="Cinematic polish",
-        seed_refinement_prompt="Improve cinematic depth while preserving layout.",
+        seed_system_prompt="Improve cinematic depth while preserving layout.",
     )
     rollout_a = _create_completed_rollout(
         store,
@@ -99,7 +100,7 @@ def test_run_gepa_optimization_writes_checkpoint_and_promotes_candidate(tmp_path
     job = store.get_aesthetic_job(job_id)
     assert job is not None
     assert job["active_candidate_id"] == checkpoint["new_candidate_id"]
-    assert job["compiled_gepa_prompt"] == checkpoint["compiled_prompt"]
+    assert job["compiled_system_prompt"] == checkpoint["compiled_prompt"]
 
 
 def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
@@ -112,7 +113,7 @@ def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
     job_id = store.create_aesthetic_job(
         name="fallback-job",
         description="Fallback behavior check",
-        seed_refinement_prompt="Keep composition while improving texture.",
+        seed_system_prompt="Keep composition while improving texture.",
     )
     rollout = _create_completed_rollout(
         store,

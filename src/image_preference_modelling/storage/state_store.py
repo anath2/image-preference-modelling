@@ -20,7 +20,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -28,6 +28,7 @@ VALID_RATING_SESSION_STATUSES = {"active", "archived"}
 VALID_RATING_OUTCOMES = {"winner", "both_good", "both_bad", "cant_decide"}
 VALID_AESTHETIC_JOB_STATUSES = {"active", "archived"}
 VALID_ROLLOUT_STATUSES = {"generated", "feedback_complete"}
+VALID_ROLLOUT_GENERATION_MODES = {"image_conditioned", "text_only"}
 
 
 class StateStore:
@@ -48,7 +49,7 @@ class StateStore:
     def _init_db(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA foreign_keys = ON;")
-            self._create_schema_v4(connection)
+            self._create_schema_v5(connection)
             self._migrate_to_latest(connection)
             connection.commit()
 
@@ -78,7 +79,7 @@ class StateStore:
             (str(version),),
         )
 
-    def _create_schema_v4(self, connection: sqlite3.Connection) -> None:
+    def _create_schema_v5(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_meta (
@@ -183,9 +184,9 @@ class StateStore:
                 name TEXT NOT NULL,
                 description TEXT NOT NULL,
                 status TEXT NOT NULL,
-                seed_refinement_prompt TEXT NOT NULL,
+                seed_system_prompt TEXT NOT NULL,
                 active_candidate_id TEXT,
-                compiled_gepa_prompt TEXT,
+                compiled_system_prompt TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -197,9 +198,10 @@ class StateStore:
                 prompt_text TEXT NOT NULL,
                 intent_text TEXT NOT NULL,
                 baseline_image_uri TEXT NOT NULL,
-                refined_image_uri TEXT NOT NULL,
+                candidate_image_uri TEXT NOT NULL,
                 candidate_id TEXT,
-                refinement_prompt TEXT NOT NULL,
+                system_prompt TEXT NOT NULL,
+                generation_mode TEXT NOT NULL,
                 model_config_json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -242,6 +244,10 @@ class StateStore:
         if current_version == 3:
             self._migrate_v3_to_v4(connection)
             current_version = 4
+
+        if current_version == 4:
+            self._migrate_v4_to_v5(connection)
+            current_version = 5
 
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
@@ -331,6 +337,47 @@ class StateStore:
             """
         )
         self._set_schema_version(connection, 4)
+
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        aesthetic_job_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(aesthetic_jobs)").fetchall()
+        }
+        if "seed_system_prompt" not in aesthetic_job_columns:
+            connection.execute(
+                "ALTER TABLE aesthetic_jobs ADD COLUMN seed_system_prompt TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                "UPDATE aesthetic_jobs SET seed_system_prompt = seed_refinement_prompt WHERE seed_system_prompt = ''"
+            )
+        if "compiled_system_prompt" not in aesthetic_job_columns:
+            connection.execute("ALTER TABLE aesthetic_jobs ADD COLUMN compiled_system_prompt TEXT")
+            connection.execute(
+                """
+                UPDATE aesthetic_jobs
+                SET compiled_system_prompt = compiled_gepa_prompt
+                WHERE compiled_system_prompt IS NULL AND compiled_gepa_prompt IS NOT NULL
+                """
+            )
+
+        rollout_columns = {row[1] for row in connection.execute("PRAGMA table_info(rollouts)").fetchall()}
+        if "candidate_image_uri" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN candidate_image_uri TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                "UPDATE rollouts SET candidate_image_uri = refined_image_uri WHERE candidate_image_uri = ''"
+            )
+        if "system_prompt" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN system_prompt TEXT NOT NULL DEFAULT ''")
+            connection.execute(
+                "UPDATE rollouts SET system_prompt = refinement_prompt WHERE system_prompt = ''"
+            )
+        if "generation_mode" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN generation_mode TEXT NOT NULL DEFAULT 'image_conditioned'"
+            )
+
+        self._set_schema_version(connection, 5)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -603,17 +650,15 @@ class StateStore:
             connection.commit()
         return comparison_id
 
-    def create_aesthetic_job(
-        self, name: str, description: str, seed_refinement_prompt: str
-    ) -> str:
+    def create_aesthetic_job(self, name: str, description: str, seed_system_prompt: str) -> str:
         job_id = f"job_{uuid.uuid4().hex[:10]}"
         created_at = _utc_now()
         with self._connect() as connection:
             connection.execute(
                 """
                 INSERT INTO aesthetic_jobs (
-                    id, name, description, status, seed_refinement_prompt,
-                    active_candidate_id, compiled_gepa_prompt, created_at, updated_at
+                    id, name, description, status, seed_system_prompt,
+                    active_candidate_id, compiled_system_prompt, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -621,7 +666,7 @@ class StateStore:
                     name.strip(),
                     description.strip(),
                     "active",
-                    seed_refinement_prompt.strip(),
+                    seed_system_prompt.strip(),
                     None,
                     None,
                     created_at,
@@ -650,7 +695,7 @@ class StateStore:
         return dict(row) if row else None
 
     def update_aesthetic_job_policy(
-        self, job_id: str, active_candidate_id: str | None, compiled_gepa_prompt: str | None
+        self, job_id: str, active_candidate_id: str | None, compiled_system_prompt: str | None
     ) -> None:
         if self.get_aesthetic_job(job_id) is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
@@ -658,10 +703,10 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE aesthetic_jobs
-                SET active_candidate_id = ?, compiled_gepa_prompt = ?, updated_at = ?
+                SET active_candidate_id = ?, compiled_system_prompt = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (active_candidate_id, compiled_gepa_prompt, _utc_now(), job_id),
+                (active_candidate_id, compiled_system_prompt, _utc_now(), job_id),
             )
             connection.commit()
 
@@ -672,11 +717,14 @@ class StateStore:
         prompt_text: str,
         intent_text: str,
         baseline_image_uri: str,
-        refined_image_uri: str,
+        candidate_image_uri: str,
         candidate_id: str | None,
-        refinement_prompt: str,
+        system_prompt: str,
+        generation_mode: str,
         model_config: dict[str, Any],
     ) -> str:
+        if generation_mode not in VALID_ROLLOUT_GENERATION_MODES:
+            raise ValueError(f"Unsupported rollout generation_mode: {generation_mode}")
         if self.get_aesthetic_job(job_id) is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
         rollout_id = f"rollout_{uuid.uuid4().hex[:10]}"
@@ -686,9 +734,9 @@ class StateStore:
                 """
                 INSERT INTO rollouts (
                     id, job_id, comparison_id, prompt_text, intent_text,
-                    baseline_image_uri, refined_image_uri, candidate_id, refinement_prompt,
-                    model_config_json, status, created_at, feedback_completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    baseline_image_uri, candidate_image_uri, candidate_id, system_prompt,
+                    generation_mode, model_config_json, status, created_at, feedback_completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rollout_id,
@@ -697,9 +745,10 @@ class StateStore:
                     prompt_text,
                     intent_text,
                     baseline_image_uri,
-                    refined_image_uri,
+                    candidate_image_uri,
                     candidate_id,
-                    refinement_prompt,
+                    system_prompt,
+                    generation_mode,
                     json.dumps(model_config),
                     "generated",
                     created_at,
@@ -804,7 +853,7 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE aesthetic_jobs
-                SET active_candidate_id = ?, compiled_gepa_prompt = ?, updated_at = ?
+                SET active_candidate_id = ?, compiled_system_prompt = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (candidate_id, candidate["compiled_prompt"], _utc_now(), job_id),
@@ -893,9 +942,10 @@ class StateStore:
                 r.prompt_text,
                 r.intent_text,
                 r.baseline_image_uri,
-                r.refined_image_uri,
+                r.candidate_image_uri,
                 r.candidate_id,
-                r.refinement_prompt,
+                r.system_prompt,
+                r.generation_mode,
                 r.model_config_json,
                 r.status,
                 r.created_at,
@@ -1024,7 +1074,7 @@ class StateStore:
                     )
             rollouts = connection.execute(
                 """
-                SELECT r.id, r.job_id, r.status, j.id AS job_exists
+                SELECT r.id, r.job_id, r.status, r.generation_mode, j.id AS job_exists
                 FROM rollouts r
                 LEFT JOIN aesthetic_jobs j ON j.id = r.job_id
                 """
@@ -1038,6 +1088,11 @@ class StateStore:
                 if rollout["status"] not in VALID_ROLLOUT_STATUSES:
                     issues["invalid_rollouts"].append(
                         f"{rollout_id}: invalid rollout status `{rollout['status']}`"
+                    )
+                mode = rollout["generation_mode"] if "generation_mode" in rollout.keys() else None
+                if mode is not None and mode not in VALID_ROLLOUT_GENERATION_MODES:
+                    issues["invalid_rollouts"].append(
+                        f"{rollout_id}: invalid rollout generation_mode `{mode}`"
                     )
 
         return issues

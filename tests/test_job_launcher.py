@@ -97,7 +97,7 @@ def test_gepa_run_config_preserves_job_id_and_minibatch_size(tmp_path: Path) -> 
     job_id = store.create_aesthetic_job(
         name="launcher-job",
         description="job for launcher test",
-        seed_refinement_prompt="Preserve intent while improving style.",
+        seed_system_prompt="Preserve intent while improving style.",
     )
     session_id = store.create_rating_session(name="launcher-session")
     rollout_id = store.create_rollout(
@@ -105,16 +105,17 @@ def test_gepa_run_config_preserves_job_id_and_minibatch_size(tmp_path: Path) -> 
         prompt_text="city at dusk",
         intent_text="city at dusk",
         baseline_image_uri="baseline.png",
-        refined_image_uri="refined.png",
+        candidate_image_uri="candidate.png",
         candidate_id=None,
-        refinement_prompt="Improve color depth.",
+        system_prompt="Improve color depth.",
+        generation_mode="text_only",
         model_config={"image_model": "test-model"},
     )
     comparison_id = store.add_comparison(
         session_id=session_id,
         prompt_text="city at dusk",
         left_image_uri="baseline.png",
-        right_image_uri="refined.png",
+        right_image_uri="candidate.png",
         winner="right",
         critique="Refined output has stronger contrast and detail.",
         outcome="winner",
