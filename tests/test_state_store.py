@@ -568,3 +568,49 @@ def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
 
     store.archive_aesthetic_job(job_id)
     assert store.get_aesthetic_job(job_id)["status"] == "archived"  # type: ignore[index]
+
+
+def test_list_rollouts_for_job_returns_metadata_and_feedback(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="inspector",
+        description="inspector job",
+        seed_system_prompt="seed",
+    )
+    session_id = store.create_rating_session(name="inspector-session")
+    rollout_id = store.create_rollout(
+        job_id=job_id,
+        prompt_text="prompt",
+        intent_text="intent",
+        baseline_image_uri="baseline.png",
+        candidate_image_uri="candidate.png",
+        candidate_id=None,
+        system_prompt="system prompt",
+        prompt_category="portrait",
+        selection_mode="llm_guided",
+        llm_score=0.93,
+        llm_reason="strong fit",
+        generation_mode="text_only",
+        model_config={"image_model": "test"},
+    )
+    comparison_id = store.add_comparison(
+        session_id=session_id,
+        prompt_text="prompt",
+        left_image_uri="baseline.png",
+        right_image_uri="candidate.png",
+        winner="right",
+        critique="candidate better",
+        outcome="winner",
+    )
+    store.mark_rollout_feedback_complete(rollout_id, comparison_id)
+
+    rollouts = store.list_rollouts_for_job(job_id)
+    assert len(rollouts) == 1
+    item = rollouts[0]
+    assert item["id"] == rollout_id
+    assert item["selection_mode"] == "llm_guided"
+    assert item["llm_score"] == 0.93
+    assert item["llm_reason"] == "strong fit"
+    assert item["winner"] == "right"
+    assert item["outcome"] == "winner"
+    assert item["model_config"]["image_model"] == "test"

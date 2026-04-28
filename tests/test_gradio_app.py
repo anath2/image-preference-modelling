@@ -49,6 +49,8 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Create Job" in buttons
     assert "Update Selected Job" in buttons
     assert "Archive Selected Job" in buttons
+    assert "Refresh Inspector Jobs" in buttons
+    assert "Load Rollouts" in buttons
     assert "Use Selected Job" in buttons
     assert "Refresh Jobs" in buttons
     assert "Run GEPA Optimization" in buttons
@@ -65,8 +67,14 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "GEPA Minibatch Size" in labels
     assert "Latest GEPA Run Status" in labels
     assert "GEPA Run Logs" in labels
-    assert "Sampled Prompt" in labels
-    assert "Active System Prompt" in labels
+    assert "Prompt" in labels
+    assert "Baseline System Prompt" in labels
+    assert "Candidate System Prompt" in labels
+    assert "Inspect Job" in labels
+    assert "Rollout" in labels
+    assert "Rollout Metadata" in labels
+    assert "Inspector Baseline" in labels
+    assert "Inspector Candidate" in labels
     assert "Baseline" in labels
     assert "Candidate" in labels
     assert tuple(choice[0] for choice in winner_radio.choices) == (

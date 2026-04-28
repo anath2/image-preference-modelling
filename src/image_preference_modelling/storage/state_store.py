@@ -47,6 +47,9 @@ class StateStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _table_columns(self, connection: sqlite3.Connection, table_name: str) -> set[str]:
+        return {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
     def _init_db(self) -> None:
         with self._connect() as connection:
             connection.execute("PRAGMA foreign_keys = ON;")
@@ -741,29 +744,33 @@ class StateStore:
         created_at = _utc_now()
         cleaned_seed = seed_system_prompt.strip()
         with self._connect() as connection:
+            table_columns = self._table_columns(connection, "aesthetic_jobs")
+            payload: dict[str, Any] = {
+                "id": job_id,
+                "name": name.strip(),
+                "description": description.strip(),
+                "status": "active",
+                "seed_system_prompt": cleaned_seed,
+                "baseline_system_prompt": "",
+                "latest_system_prompt": cleaned_seed,
+                "sampling_profile_json": json.dumps(sampling_profile or {}),
+                "gepa_enable_threshold": max(1, int(gepa_enable_threshold)),
+                "active_candidate_id": None,
+                "compiled_system_prompt": cleaned_seed,
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
+            # Backward-compatible population for legacy columns still present in migrated DBs.
+            if "seed_refinement_prompt" in table_columns:
+                payload["seed_refinement_prompt"] = cleaned_seed
+            if "compiled_gepa_prompt" in table_columns:
+                payload["compiled_gepa_prompt"] = cleaned_seed
+            insert_columns = [col for col in payload.keys() if col in table_columns]
+            placeholders = ", ".join("?" for _ in insert_columns)
+            column_list = ", ".join(insert_columns)
             connection.execute(
-                """
-                INSERT INTO aesthetic_jobs (
-                    id, name, description, status, seed_system_prompt, baseline_system_prompt,
-                    latest_system_prompt, sampling_profile_json, gepa_enable_threshold,
-                    active_candidate_id, compiled_system_prompt, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    name.strip(),
-                    description.strip(),
-                    "active",
-                    cleaned_seed,
-                    "",
-                    cleaned_seed,
-                    json.dumps(sampling_profile or {}),
-                    max(1, int(gepa_enable_threshold)),
-                    None,
-                    cleaned_seed,
-                    created_at,
-                    created_at,
-                ),
+                f"INSERT INTO aesthetic_jobs ({column_list}) VALUES ({placeholders})",
+                tuple(payload[col] for col in insert_columns),
             )
             connection.commit()
         return job_id
@@ -911,38 +918,40 @@ class StateStore:
         resolved_rollout_id = rollout_id or f"rollout_{uuid.uuid4().hex[:10]}"
         created_at = _utc_now()
         with self._connect() as connection:
+            table_columns = self._table_columns(connection, "rollouts")
+            payload: dict[str, Any] = {
+                "id": resolved_rollout_id,
+                "job_id": job_id,
+                "comparison_id": None,
+                "prompt_text": prompt_text,
+                "intent_text": intent_text,
+                "baseline_image_uri": baseline_image_uri,
+                "candidate_image_uri": candidate_image_uri,
+                "candidate_id": candidate_id,
+                "system_prompt": system_prompt,
+                "baseline_system_prompt_snapshot": baseline_system_prompt_snapshot,
+                "latest_system_prompt_snapshot": latest_system_prompt_snapshot,
+                "prompt_category": prompt_category,
+                "selection_mode": selection_mode,
+                "llm_score": llm_score,
+                "llm_reason": llm_reason,
+                "generation_mode": generation_mode,
+                "model_config_json": json.dumps(model_config),
+                "status": "generated",
+                "created_at": created_at,
+                "feedback_completed_at": None,
+            }
+            # Backward-compatible population for legacy columns still present in migrated DBs.
+            if "refined_image_uri" in table_columns:
+                payload["refined_image_uri"] = candidate_image_uri
+            if "refinement_prompt" in table_columns:
+                payload["refinement_prompt"] = system_prompt
+            insert_columns = [col for col in payload.keys() if col in table_columns]
+            placeholders = ", ".join("?" for _ in insert_columns)
+            column_list = ", ".join(insert_columns)
             connection.execute(
-                """
-                INSERT INTO rollouts (
-                    id, job_id, comparison_id, prompt_text, intent_text,
-                    baseline_image_uri, candidate_image_uri, candidate_id, system_prompt,
-                    baseline_system_prompt_snapshot, latest_system_prompt_snapshot, prompt_category,
-                    selection_mode, llm_score, llm_reason, generation_mode,
-                    model_config_json, status, created_at, feedback_completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    resolved_rollout_id,
-                    job_id,
-                    None,
-                    prompt_text,
-                    intent_text,
-                    baseline_image_uri,
-                    candidate_image_uri,
-                    candidate_id,
-                    system_prompt,
-                    baseline_system_prompt_snapshot,
-                    latest_system_prompt_snapshot,
-                    prompt_category,
-                    selection_mode,
-                    llm_score,
-                    llm_reason,
-                    generation_mode,
-                    json.dumps(model_config),
-                    "generated",
-                    created_at,
-                    None,
-                ),
+                f"INSERT INTO rollouts ({column_list}) VALUES ({placeholders})",
+                tuple(payload[col] for col in insert_columns),
             )
             connection.commit()
         return resolved_rollout_id
@@ -1202,6 +1211,30 @@ class StateStore:
             item["model_config"] = json.loads(item.pop("model_config_json"))
             items.append(item)
         return items
+
+    def list_rollouts_for_job(self, job_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    r.*,
+                    c.winner,
+                    c.outcome,
+                    c.critique
+                FROM rollouts r
+                LEFT JOIN comparisons c ON c.id = r.comparison_id
+                WHERE r.job_id = ?
+                ORDER BY r.created_at DESC
+                LIMIT ?
+                """,
+                (job_id, max(1, int(limit))),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["model_config"] = json.loads(item.pop("model_config_json"))
+            results.append(item)
+        return results
 
     def list_recent_comparisons(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as connection:
