@@ -555,10 +555,29 @@ def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
     )
     store.mark_rollout_feedback_complete(rollout_b, cmp_b)
     gate = store.get_gepa_gate_status(job_id)
-    assert gate["baseline_wins"] == 2
-    assert gate["candidate_wins"] == 0
+    assert gate["completed_feedback_count"] == 2
+    assert gate["new_feedback_count"] == 2
     assert gate["threshold"] == 3
     assert gate["enabled"] is False
+    assert gate["last_gepa_completed_at"] is None
+    assert set(store.list_gepa_eligible_rollout_ids_for_job(job_id, limit=3)) == {
+        rollout_a,
+        rollout_b,
+    }
+
+    gepa_run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA gate checkpoint",
+        config={"job_id": job_id, "minibatch_size": 2, "selected_rollout_ids": [rollout_a, rollout_b]},
+    )
+    store.update_run_status(gepa_run_id, "running")
+    store.update_run_status(gepa_run_id, "completed")
+    gate_after_run = store.get_gepa_gate_status(job_id)
+    assert gate_after_run["completed_feedback_count"] == 2
+    assert gate_after_run["new_feedback_count"] == 0
+    assert gate_after_run["enabled"] is False
+    assert gate_after_run["last_gepa_completed_at"] is not None
+    assert store.list_gepa_eligible_rollout_ids_for_job(job_id, limit=3) == []
 
     store.rollover_job_system_prompt(job_id, latest_system_prompt="optimized prompt")
     rolled = store.get_aesthetic_job(job_id)

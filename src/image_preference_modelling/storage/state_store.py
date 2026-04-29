@@ -1071,33 +1071,63 @@ class StateStore:
             )
             connection.commit()
 
+    def _latest_completed_gepa_finished_at_for_job(
+        self, connection: sqlite3.Connection, job_id: str
+    ) -> str | None:
+        rows = connection.execute(
+            """
+            SELECT config_json, finished_at
+            FROM runs
+            WHERE run_type = 'gepa'
+                AND status = 'completed'
+                AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                config = json.loads(row["config_json"])
+            except json.JSONDecodeError:
+                continue
+            if str(config.get("job_id") or "").strip() == job_id:
+                return str(row["finished_at"])
+        return None
+
     def get_gepa_gate_status(self, job_id: str) -> dict[str, Any]:
         job = self.get_aesthetic_job(job_id)
         if job is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
         threshold = max(1, int(job.get("gepa_enable_threshold") or DEFAULT_GEPA_ENABLE_THRESHOLD))
         with self._connect() as connection:
-            row = connection.execute(
+            total_completed = connection.execute(
                 """
-                SELECT
-                    SUM(CASE WHEN c.outcome = 'winner' AND c.winner = 'left' THEN 1 ELSE 0 END) AS baseline_wins,
-                    SUM(CASE WHEN c.outcome = 'winner' AND c.winner = 'right' THEN 1 ELSE 0 END) AS candidate_wins
-                FROM rollouts r
-                JOIN comparisons c ON c.id = r.comparison_id
-                WHERE r.job_id = ? AND r.status = 'feedback_complete'
+                SELECT COUNT(*)
+                FROM rollouts
+                WHERE job_id = ? AND status = 'feedback_complete'
                 """,
                 (job_id,),
-            ).fetchone()
-        baseline_wins = int(row["baseline_wins"] or 0) if row else 0
-        candidate_wins = int(row["candidate_wins"] or 0) if row else 0
-        lead = baseline_wins - candidate_wins
-        enabled = baseline_wins > candidate_wins and lead >= threshold
+            ).fetchone()[0]
+            last_completed_at = self._latest_completed_gepa_finished_at_for_job(connection, job_id)
+            if last_completed_at is None:
+                new_feedback = total_completed
+            else:
+                new_feedback = connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM rollouts
+                    WHERE job_id = ?
+                        AND status = 'feedback_complete'
+                        AND feedback_completed_at > ?
+                    """,
+                    (job_id, last_completed_at),
+                ).fetchone()[0]
+        new_feedback_count = int(new_feedback or 0)
         return {
-            "baseline_wins": baseline_wins,
-            "candidate_wins": candidate_wins,
+            "completed_feedback_count": int(total_completed or 0),
+            "new_feedback_count": new_feedback_count,
             "threshold": threshold,
-            "enabled": enabled,
-            "lead": lead,
+            "enabled": new_feedback_count >= threshold,
+            "last_gepa_completed_at": last_completed_at,
         }
 
     def mark_rollout_feedback_complete(self, rollout_id: str, comparison_id: str) -> None:
@@ -1165,6 +1195,36 @@ class StateStore:
                 """,
                 (job_id, bounded_limit),
             ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def list_gepa_eligible_rollout_ids_for_job(self, job_id: str, limit: int) -> list[str]:
+        bounded_limit = max(1, int(limit))
+        with self._connect() as connection:
+            last_completed_at = self._latest_completed_gepa_finished_at_for_job(connection, job_id)
+            if last_completed_at is None:
+                rows = connection.execute(
+                    """
+                    SELECT id
+                    FROM rollouts
+                    WHERE job_id = ? AND status = 'feedback_complete'
+                    ORDER BY feedback_completed_at DESC
+                    LIMIT ?
+                    """,
+                    (job_id, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id
+                    FROM rollouts
+                    WHERE job_id = ?
+                        AND status = 'feedback_complete'
+                        AND feedback_completed_at > ?
+                    ORDER BY feedback_completed_at DESC
+                    LIMIT ?
+                    """,
+                    (job_id, last_completed_at, bounded_limit),
+                ).fetchall()
         return [str(row["id"]) for row in rows]
 
     def get_completed_rollouts_with_feedback(

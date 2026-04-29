@@ -212,11 +212,13 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         def _gepa_button_state(job_id: str) -> tuple[Any, str]:
             gate = ctx.state_store.get_gepa_gate_status(job_id)
             message = (
-                f"GEPA enabled: baseline lead {gate['lead']} meets threshold {gate['threshold']}."
+                "GEPA enabled: "
+                f"{gate['new_feedback_count']} new feedback items meet threshold {gate['threshold']}."
                 if gate["enabled"]
                 else (
-                    "GEPA disabled: baseline wins="
-                    f"{gate['baseline_wins']}, candidate wins={gate['candidate_wins']}, threshold={gate['threshold']}."
+                    "GEPA disabled: "
+                    f"{gate['new_feedback_count']} new feedback items since last GEPA run; "
+                    f"threshold={gate['threshold']}."
                 )
             )
             return gr.update(interactive=bool(gate["enabled"])), message
@@ -314,27 +316,28 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                     "No GEPA run yet.",
                     str(completed_count),
                     (
-                        "GEPA is disabled: baseline wins="
-                        f"{gate['baseline_wins']}, candidate wins={gate['candidate_wins']}, "
+                        "GEPA is disabled: "
+                        f"{gate['new_feedback_count']} new feedback items since last GEPA run; "
                         f"threshold={gate['threshold']}."
                     ),
                     "",
                     gr.update(active=False),
                 )
-            if completed_count < chosen_minibatch:
+            selected_rollout_ids = ctx.state_store.list_gepa_eligible_rollout_ids_for_job(
+                selected_job_id,
+                limit=chosen_minibatch,
+            )
+            if len(selected_rollout_ids) < chosen_minibatch:
                 return (
                     "No GEPA run yet.",
                     str(completed_count),
                     (
-                        f"Need at least {chosen_minibatch} completed rollouts; currently {completed_count}."
+                        f"Need at least {chosen_minibatch} new completed rollouts since last GEPA; "
+                        f"currently {len(selected_rollout_ids)}."
                     ),
                     "",
                     gr.update(active=False),
                 )
-            selected_rollout_ids = ctx.state_store.list_completed_rollout_ids_for_job(
-                selected_job_id,
-                limit=chosen_minibatch,
-            )
             run_config = _build_gepa_run_config(
                 job_id=selected_job_id,
                 minibatch_size=chosen_minibatch,
