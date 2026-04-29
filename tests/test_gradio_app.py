@@ -56,6 +56,7 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Run GEPA Optimization" in buttons
     assert "Refresh GEPA Status" in buttons
     assert "Show GEPA Run Logs" in buttons
+    assert "Generate Latest Prompt Check" in buttons
     assert "Active Job" in labels
     assert "Selected Job Name" in labels
     assert "Latest System Prompt" in labels
@@ -67,6 +68,9 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "GEPA Minibatch Size" in labels
     assert "Latest GEPA Run Status" in labels
     assert "GEPA Run Logs" in labels
+    assert "Latest Check Prompt" in labels
+    assert "Latest Check Baseline" in labels
+    assert "Latest Check Candidate" in labels
     assert "Prompt" in labels
     assert "Baseline System Prompt" in labels
     assert "Candidate System Prompt" in labels

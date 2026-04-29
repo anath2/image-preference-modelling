@@ -97,6 +97,8 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         active_job_id_state = gr.State(value="")
         active_rollout_id_state = gr.State(value="")
         latest_gepa_run_id_state = gr.State(value="")
+        latest_check_baseline_path_state = gr.State(value="")
+        latest_check_candidate_path_state = gr.State(value="")
 
         workflow_status = gr.Markdown("Ready. Start with `Sample Prompt`.")
 
@@ -189,9 +191,18 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             with gr.Tab("Latest Prompt Check"):
                 gr.Markdown("## Latest Prompt Check")
                 gr.Markdown(
-                    "Reserved for one-off baseline vs latest-prompt generation. "
-                    "This pass only separates the UI; generation behavior will be added later."
+                    "Generate a one-off no-system baseline beside the selected job's latest compiled prompt. "
+                    "These checks are stored separately from completed training feedback."
                 )
+                latest_check_prompt = gr.Textbox(
+                    label="Latest Check Prompt",
+                    interactive=True,
+                    placeholder="Type a prompt to compare the latest job prompt against baseline.",
+                )
+                generate_latest_check_btn = gr.Button("Generate Latest Prompt Check")
+                with gr.Row():
+                    latest_check_baseline_image = gr.Image(label="Latest Check Baseline", type="filepath")
+                    latest_check_candidate_image = gr.Image(label="Latest Check Candidate", type="filepath")
 
             with gr.Tab("Rollout Inspector"):
                 gr.Markdown("## Rollout Inspector")
@@ -493,6 +504,80 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 candidate_value,
                 json.dumps(metadata, indent=2),
                 f"Showing rollout `{selected_rollout}`{status_suffix}.",
+            )
+
+        def _generate_latest_prompt_check(
+            prompt: str,
+            active_job_id: str,
+        ) -> tuple[str | None, str | None, str, str, str]:
+            cleaned_prompt = prompt.strip()
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return None, None, "", "", "Select and activate an aesthetic job first."
+            if not cleaned_prompt:
+                return None, None, "", "", "Enter a prompt for the latest prompt check."
+            job = ctx.state_store.get_aesthetic_job(selected_job_id)
+            if job is None:
+                return None, None, "", "", "Selected job is unavailable."
+
+            latest_prompt = _resolve_active_system_prompt(job)
+            if not latest_prompt:
+                return None, None, "", "", "Selected job does not have a latest system prompt."
+
+            settings = ImageGenerationModelSettings.from_env()
+            rollout_id = f"rollout_{uuid.uuid4().hex[:10]}"
+            rollout_dir = rollout_image_dir(selected_job_id, rollout_id)
+            rollout_dir.mkdir(parents=True, exist_ok=True)
+            baseline_data_url = generate_image_from_openrouter(
+                cleaned_prompt,
+                settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            )
+            baseline_path = save_generated_image(
+                baseline_data_url,
+                rollout_dir,
+                stem="latest-check-baseline",
+            )
+            system_prompt = build_candidate_system_prompt(
+                original_prompt=cleaned_prompt,
+                regeneration_instructions=latest_prompt,
+            )
+            candidate_data_url = generate_candidate_image_from_openrouter(
+                cleaned_prompt,
+                system_prompt,
+                settings,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            )
+            candidate_path = save_generated_image(
+                candidate_data_url,
+                rollout_dir,
+                stem="latest-check-candidate",
+            )
+            ctx.state_store.create_rollout(
+                rollout_id=rollout_id,
+                job_id=selected_job_id,
+                prompt_text=cleaned_prompt,
+                intent_text=cleaned_prompt,
+                baseline_image_uri=str(baseline_path),
+                candidate_image_uri=str(candidate_path),
+                candidate_id=job.get("active_candidate_id"),
+                system_prompt=system_prompt,
+                baseline_system_prompt_snapshot=str(job.get("baseline_system_prompt") or ""),
+                latest_system_prompt_snapshot=str(job.get("latest_system_prompt") or ""),
+                rollout_type="latest_prompt_check",
+                left_candidate_id=None,
+                right_candidate_id=job.get("active_candidate_id"),
+                left_system_prompt_snapshot=str(job.get("baseline_system_prompt") or ""),
+                right_system_prompt_snapshot=system_prompt,
+                generation_mode="text_only",
+                model_config={"image_model": settings.image_model},
+            )
+            return (
+                str(baseline_path),
+                str(candidate_path),
+                str(baseline_path),
+                str(candidate_path),
+                f"Latest prompt check generated as rollout `{rollout_id}`.",
             )
 
         def _sample_prompt(active_job_id: str) -> tuple[str, str, str, str, str, str]:
@@ -840,6 +925,18 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 baseline_prompt_text,
                 candidate_prompt_text,
                 gepa_poll_timer,
+            ],
+        )
+
+        generate_latest_check_btn.click(
+            _generate_latest_prompt_check,
+            inputs=[latest_check_prompt, active_job_id_state],
+            outputs=[
+                latest_check_baseline_image,
+                latest_check_candidate_image,
+                latest_check_baseline_path_state,
+                latest_check_candidate_path_state,
+                workflow_status,
             ],
         )
 
