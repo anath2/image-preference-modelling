@@ -98,93 +98,112 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         active_rollout_id_state = gr.State(value="")
         latest_gepa_run_id_state = gr.State(value="")
 
-        gr.Markdown("## Aesthetic Job")
-        with gr.Row():
-            selected_job = gr.Dropdown(label="Active Job", choices=[], value=None)
-            refresh_jobs_btn = gr.Button("Refresh Jobs")
-            use_selected_job_btn = gr.Button("Use Selected Job")
-        create_job_name = gr.Textbox(label="New Job Name")
-        create_job_description = gr.Textbox(label="New Job Description")
-        create_job_seed_prompt = gr.Textbox(label="Seed System Prompt")
-        create_job_category = gr.Dropdown(
-            label="Guided Sampling Category",
-            choices=["portrait", "outdoor_landscape", "cityscape"],
-            value="portrait",
-        )
-        create_job_threshold = gr.Number(label="GEPA Enable Threshold", value=2, minimum=1, precision=0)
-        create_job_btn = gr.Button("Create Job")
-        update_job_name = gr.Textbox(label="Update Job Name")
-        update_job_description = gr.Textbox(label="Update Job Description")
-        update_job_category = gr.Dropdown(
-            label="Update Sampling Category",
-            choices=["portrait", "outdoor_landscape", "cityscape"],
-            value="portrait",
-        )
-        update_job_threshold = gr.Number(label="Update GEPA Threshold", value=2, minimum=1, precision=0)
-        update_job_btn = gr.Button("Update Selected Job")
-        archive_job_btn = gr.Button("Archive Selected Job")
-        active_job_name = gr.Textbox(label="Selected Job Name", interactive=False)
-        compiled_prompt_view = gr.Textbox(label="Latest System Prompt", interactive=False)
-
-        with gr.Group(visible=False) as rollout_workflow_group:
-            with gr.Row():
-                sample_prompt_btn = gr.Button("Sample Prompt")
-                generate_baseline_btn = gr.Button("Generate Baseline")
-                generate_candidate_btn = gr.Button("Generate Candidate")
-
-            sampled_prompt = gr.Textbox(
-                label="Prompt",
-                interactive=True,
-                placeholder="Sample a prompt or type your own prompt here.",
-            )
-            baseline_prompt_text = gr.Textbox(label="Baseline System Prompt", interactive=False)
-            candidate_prompt_text = gr.Textbox(label="Candidate System Prompt", interactive=False)
-
-            with gr.Row():
-                baseline_image = gr.Image(label="Baseline", type="filepath")
-                candidate_image = gr.Image(label="Candidate", type="filepath")
-
-            winner_choice = gr.Radio(
-                choices=["baseline", "candidate", "both_good", "both_bad", "cant_decide"],
-                value="cant_decide",
-                label="Winner",
-            )
-            critique_text = gr.Textbox(label="Critique")
-            submit_score_btn = gr.Button("Submit Score")
-
-        gr.Markdown("## GEPA Optimization")
-        completed_feedback_count = gr.Textbox(label="Completed Feedback Count", interactive=False, value="0")
-        minibatch_size = gr.Number(
-            label="GEPA Minibatch Size",
-            value=3,
-            minimum=1,
-            maximum=10,
-            precision=0,
-        )
-        run_gepa_btn = gr.Button("Run GEPA Optimization")
-        refresh_gepa_status_btn = gr.Button("Refresh GEPA Status")
-        show_gepa_logs_btn = gr.Button("Show GEPA Run Logs")
-        gepa_poll_timer = gr.Timer(value=2.0, active=False)
-        latest_gepa_run_status = gr.Textbox(label="Latest GEPA Run Status", interactive=False, value="No GEPA run yet.")
-        gepa_run_logs = gr.Textbox(
-            label="GEPA Run Logs",
-            interactive=False,
-            lines=14,
-            max_lines=24,
-            value="No GEPA logs yet.",
-        )
         workflow_status = gr.Markdown("Ready. Start with `Sample Prompt`.")
 
-        gr.Markdown("## Rollout Inspector")
-        with gr.Row():
-            inspector_job = gr.Dropdown(label="Inspect Job", choices=[], value=None)
-            refresh_inspector_jobs_btn = gr.Button("Refresh Inspector Jobs")
-        refresh_rollouts_btn = gr.Button("Load Rollouts")
-        inspector_rollout = gr.Dropdown(label="Rollout", choices=[], value=None)
-        rollout_metadata = gr.Textbox(label="Rollout Metadata", interactive=False, lines=14, max_lines=24)
-        with gr.Row():
-            inspector_baseline_image = gr.Image(label="Inspector Baseline", type="filepath")
-            inspector_candidate_image = gr.Image(label="Inspector Candidate", type="filepath")
+        with gr.Tabs():
+            with gr.Tab("Jobs"):
+                gr.Markdown("## Aesthetic Job")
+                with gr.Row():
+                    selected_job = gr.Dropdown(label="Active Job", choices=[], value=None)
+                    refresh_jobs_btn = gr.Button("Refresh Jobs")
+                    use_selected_job_btn = gr.Button("Use Selected Job")
+                create_job_name = gr.Textbox(label="New Job Name")
+                create_job_description = gr.Textbox(label="New Job Description")
+                create_job_seed_prompt = gr.Textbox(label="Seed System Prompt")
+                create_job_category = gr.Dropdown(
+                    label="Guided Sampling Category",
+                    choices=["portrait", "outdoor_landscape", "cityscape"],
+                    value="portrait",
+                )
+                create_job_threshold = gr.Number(label="GEPA Enable Threshold", value=2, minimum=1, precision=0)
+                create_job_btn = gr.Button("Create Job")
+                update_job_name = gr.Textbox(label="Update Job Name")
+                update_job_description = gr.Textbox(label="Update Job Description")
+                update_job_category = gr.Dropdown(
+                    label="Update Sampling Category",
+                    choices=["portrait", "outdoor_landscape", "cityscape"],
+                    value="portrait",
+                )
+                update_job_threshold = gr.Number(label="Update GEPA Threshold", value=2, minimum=1, precision=0)
+                update_job_btn = gr.Button("Update Selected Job")
+                archive_job_btn = gr.Button("Archive Selected Job")
+                active_job_name = gr.Textbox(label="Selected Job Name", interactive=False)
+                compiled_prompt_view = gr.Textbox(label="Latest System Prompt", interactive=False)
+
+            with gr.Tab("Train / Compare"):
+                gr.Markdown("## Training Comparison")
+                gr.Markdown("Use the selected job to generate a baseline/candidate pair and submit feedback.")
+                with gr.Group(visible=False) as rollout_workflow_group:
+                    with gr.Row():
+                        sample_prompt_btn = gr.Button("Sample Prompt")
+                        generate_baseline_btn = gr.Button("Generate Baseline")
+                        generate_candidate_btn = gr.Button("Generate Candidate")
+
+                    sampled_prompt = gr.Textbox(
+                        label="Prompt",
+                        interactive=True,
+                        placeholder="Sample a prompt or type your own prompt here.",
+                    )
+                    baseline_prompt_text = gr.Textbox(label="Baseline System Prompt", interactive=False)
+                    candidate_prompt_text = gr.Textbox(label="Candidate System Prompt", interactive=False)
+
+                    with gr.Row():
+                        baseline_image = gr.Image(label="Baseline", type="filepath")
+                        candidate_image = gr.Image(label="Candidate", type="filepath")
+
+                    winner_choice = gr.Radio(
+                        choices=["baseline", "candidate", "both_good", "both_bad", "cant_decide"],
+                        value="cant_decide",
+                        label="Winner",
+                    )
+                    critique_text = gr.Textbox(label="Critique")
+                    submit_score_btn = gr.Button("Submit Score")
+
+            with gr.Tab("GEPA Runs"):
+                gr.Markdown("## GEPA Optimization")
+                completed_feedback_count = gr.Textbox(label="Completed Feedback Count", interactive=False, value="0")
+                minibatch_size = gr.Number(
+                    label="GEPA Minibatch Size",
+                    value=3,
+                    minimum=1,
+                    maximum=10,
+                    precision=0,
+                )
+                run_gepa_btn = gr.Button("Run GEPA Optimization")
+                refresh_gepa_status_btn = gr.Button("Refresh GEPA Status")
+                show_gepa_logs_btn = gr.Button("Show GEPA Run Logs")
+                gepa_poll_timer = gr.Timer(value=2.0, active=False)
+                latest_gepa_run_status = gr.Textbox(
+                    label="Latest GEPA Run Status",
+                    interactive=False,
+                    value="No GEPA run yet.",
+                )
+                gepa_run_logs = gr.Textbox(
+                    label="GEPA Run Logs",
+                    interactive=False,
+                    lines=14,
+                    max_lines=24,
+                    value="No GEPA logs yet.",
+                )
+
+            with gr.Tab("Latest Prompt Check"):
+                gr.Markdown("## Latest Prompt Check")
+                gr.Markdown(
+                    "Reserved for one-off baseline vs latest-prompt generation. "
+                    "This pass only separates the UI; generation behavior will be added later."
+                )
+
+            with gr.Tab("Rollout Inspector"):
+                gr.Markdown("## Rollout Inspector")
+                with gr.Row():
+                    inspector_job = gr.Dropdown(label="Inspect Job", choices=[], value=None)
+                    refresh_inspector_jobs_btn = gr.Button("Refresh Inspector Jobs")
+                refresh_rollouts_btn = gr.Button("Load Rollouts")
+                inspector_rollout = gr.Dropdown(label="Rollout", choices=[], value=None)
+                rollout_metadata = gr.Textbox(label="Rollout Metadata", interactive=False, lines=14, max_lines=24)
+                with gr.Row():
+                    inspector_baseline_image = gr.Image(label="Inspector Baseline", type="filepath")
+                    inspector_candidate_image = gr.Image(label="Inspector Candidate", type="filepath")
 
         def _refresh_job_choices() -> tuple[gr.Dropdown, str]:
             jobs = ctx.state_store.list_aesthetic_jobs()
