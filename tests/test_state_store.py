@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 7
+    assert store.schema_version() == 8
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -330,7 +330,7 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 7
+    assert store.schema_version() == 8
 
     job = store.get_aesthetic_job("job_legacy")
     assert job is not None
@@ -339,13 +339,20 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
 
     with sqlite3.connect(db_path) as connection:
         row = connection.execute(
-            "SELECT candidate_image_uri, system_prompt, generation_mode FROM rollouts WHERE id = ?",
+            """
+            SELECT candidate_image_uri, system_prompt, generation_mode, rollout_type,
+                   right_system_prompt_snapshot
+            FROM rollouts
+            WHERE id = ?
+            """,
             ("rollout_legacy",),
         ).fetchone()
     assert row is not None
     assert row[0] == "refined.png"
     assert row[1] == "legacy refinement"
     assert row[2] == "image_conditioned"
+    assert row[3] == "baseline_candidate"
+    assert row[4] == "legacy refinement"
 
 
 def test_aesthetic_job_crud_and_policy_update(tmp_path: Path) -> None:
@@ -412,12 +419,50 @@ def test_create_rollout_and_mark_feedback_complete(tmp_path: Path) -> None:
     assert completed[0]["comparison_id"] == comparison_id
     assert completed[0]["candidate_image_uri"] == "candidate.png"
     assert completed[0]["system_prompt"] == "Enhance natural warm tones."
+    assert completed[0]["rollout_type"] == "baseline_candidate"
+    assert completed[0]["left_candidate_id"] is None
+    assert completed[0]["right_candidate_id"] is None
+    assert completed[0]["left_system_prompt_snapshot"] == ""
+    assert completed[0]["right_system_prompt_snapshot"] == "Enhance natural warm tones."
     assert completed[0]["selection_mode"] is None
     assert completed[0]["llm_score"] is None
     assert completed[0]["llm_reason"] is None
     assert completed[0]["generation_mode"] == "text_only"
     assert store.count_completed_rollouts_for_job(job_id) == 1
     assert store.list_completed_rollout_ids_for_job(job_id, limit=3) == [rollout_id]
+
+
+def test_create_candidate_comparison_rollout_metadata(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="candidate-pool",
+        description="candidate pool checks",
+        seed_system_prompt="seed",
+    )
+    rollout_id = store.create_rollout(
+        job_id=job_id,
+        prompt_text="prompt",
+        intent_text="intent",
+        baseline_image_uri="left.png",
+        candidate_image_uri="right.png",
+        candidate_id="candidate_right",
+        system_prompt="right policy",
+        rollout_type="candidate_comparison",
+        left_candidate_id="candidate_left",
+        right_candidate_id="candidate_right",
+        left_system_prompt_snapshot="left policy",
+        right_system_prompt_snapshot="right policy",
+        generation_mode="text_only",
+        model_config={"model": "image-model-a"},
+    )
+
+    rollout = store.list_rollouts_for_job(job_id)[0]
+    assert rollout["id"] == rollout_id
+    assert rollout["rollout_type"] == "candidate_comparison"
+    assert rollout["left_candidate_id"] == "candidate_left"
+    assert rollout["right_candidate_id"] == "candidate_right"
+    assert rollout["left_system_prompt_snapshot"] == "left policy"
+    assert rollout["right_system_prompt_snapshot"] == "right policy"
 
 
 def test_add_comparison_requires_non_empty_critique(tmp_path: Path) -> None:

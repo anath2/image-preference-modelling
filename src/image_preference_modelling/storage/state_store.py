@@ -20,7 +20,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -28,6 +28,7 @@ VALID_RATING_SESSION_STATUSES = {"active", "archived"}
 VALID_RATING_OUTCOMES = {"winner", "both_good", "both_bad", "cant_decide"}
 VALID_AESTHETIC_JOB_STATUSES = {"active", "archived"}
 VALID_ROLLOUT_STATUSES = {"generated", "feedback_complete"}
+VALID_ROLLOUT_TYPES = {"baseline_candidate", "candidate_comparison", "latest_prompt_check"}
 VALID_ROLLOUT_GENERATION_MODES = {"image_conditioned", "text_only"}
 DEFAULT_GEPA_ENABLE_THRESHOLD = 2
 
@@ -271,6 +272,10 @@ class StateStore:
             self._migrate_v6_to_v7(connection)
             current_version = 7
 
+        if current_version == 7:
+            self._migrate_v7_to_v8(connection)
+            current_version = 8
+
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"
@@ -459,6 +464,47 @@ class StateStore:
         if "llm_reason" not in rollout_columns:
             connection.execute("ALTER TABLE rollouts ADD COLUMN llm_reason TEXT")
         self._set_schema_version(connection, 7)
+
+    def _migrate_v7_to_v8(self, connection: sqlite3.Connection) -> None:
+        rollout_columns = {row[1] for row in connection.execute("PRAGMA table_info(rollouts)").fetchall()}
+        if "rollout_type" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN rollout_type TEXT NOT NULL DEFAULT 'baseline_candidate'"
+            )
+        if "left_candidate_id" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN left_candidate_id TEXT")
+        if "right_candidate_id" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN right_candidate_id TEXT")
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET right_candidate_id = candidate_id
+                WHERE right_candidate_id IS NULL AND candidate_id IS NOT NULL
+                """
+            )
+        if "left_system_prompt_snapshot" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN left_system_prompt_snapshot TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET left_system_prompt_snapshot = baseline_system_prompt_snapshot
+                WHERE left_system_prompt_snapshot = ''
+                """
+            )
+        if "right_system_prompt_snapshot" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN right_system_prompt_snapshot TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET right_system_prompt_snapshot = system_prompt
+                WHERE right_system_prompt_snapshot = ''
+                """
+            )
+        self._set_schema_version(connection, 8)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -904,6 +950,11 @@ class StateStore:
         system_prompt: str,
         baseline_system_prompt_snapshot: str = "",
         latest_system_prompt_snapshot: str = "",
+        rollout_type: str = "baseline_candidate",
+        left_candidate_id: str | None = None,
+        right_candidate_id: str | None = None,
+        left_system_prompt_snapshot: str | None = None,
+        right_system_prompt_snapshot: str | None = None,
         prompt_category: str | None = None,
         selection_mode: str | None = None,
         llm_score: float | None = None,
@@ -911,6 +962,8 @@ class StateStore:
         generation_mode: str,
         model_config: dict[str, Any],
     ) -> str:
+        if rollout_type not in VALID_ROLLOUT_TYPES:
+            raise ValueError(f"Unsupported rollout_type: {rollout_type}")
         if generation_mode not in VALID_ROLLOUT_GENERATION_MODES:
             raise ValueError(f"Unsupported rollout generation_mode: {generation_mode}")
         if self.get_aesthetic_job(job_id) is None:
@@ -931,6 +984,17 @@ class StateStore:
                 "system_prompt": system_prompt,
                 "baseline_system_prompt_snapshot": baseline_system_prompt_snapshot,
                 "latest_system_prompt_snapshot": latest_system_prompt_snapshot,
+                "rollout_type": rollout_type,
+                "left_candidate_id": left_candidate_id,
+                "right_candidate_id": right_candidate_id if right_candidate_id is not None else candidate_id,
+                "left_system_prompt_snapshot": (
+                    left_system_prompt_snapshot
+                    if left_system_prompt_snapshot is not None
+                    else baseline_system_prompt_snapshot
+                ),
+                "right_system_prompt_snapshot": (
+                    right_system_prompt_snapshot if right_system_prompt_snapshot is not None else system_prompt
+                ),
                 "prompt_category": prompt_category,
                 "selection_mode": selection_mode,
                 "llm_score": llm_score,
@@ -1245,6 +1309,11 @@ class StateStore:
                 r.candidate_image_uri,
                 r.candidate_id,
                 r.system_prompt,
+                r.rollout_type,
+                r.left_candidate_id,
+                r.right_candidate_id,
+                r.left_system_prompt_snapshot,
+                r.right_system_prompt_snapshot,
                 r.generation_mode,
                 r.model_config_json,
                 r.status,
@@ -1398,7 +1467,7 @@ class StateStore:
                     )
             rollouts = connection.execute(
                 """
-                SELECT r.id, r.job_id, r.status, r.generation_mode, j.id AS job_exists
+                SELECT r.id, r.job_id, r.status, r.rollout_type, r.generation_mode, j.id AS job_exists
                 FROM rollouts r
                 LEFT JOIN aesthetic_jobs j ON j.id = r.job_id
                 """
@@ -1412,6 +1481,11 @@ class StateStore:
                 if rollout["status"] not in VALID_ROLLOUT_STATUSES:
                     issues["invalid_rollouts"].append(
                         f"{rollout_id}: invalid rollout status `{rollout['status']}`"
+                    )
+                rollout_type = rollout["rollout_type"] if "rollout_type" in rollout.keys() else None
+                if rollout_type is not None and rollout_type not in VALID_ROLLOUT_TYPES:
+                    issues["invalid_rollouts"].append(
+                        f"{rollout_id}: invalid rollout_type `{rollout_type}`"
                     )
                 mode = rollout["generation_mode"] if "generation_mode" in rollout.keys() else None
                 if mode is not None and mode not in VALID_ROLLOUT_GENERATION_MODES:
