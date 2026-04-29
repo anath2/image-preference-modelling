@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -24,6 +25,31 @@ def _build_compiled_prompt(
     if not condensed:
         return base
     return f"{base}\n\nFeedback reflections: {condensed}"
+
+
+def _select_parent_candidate(
+    *,
+    job: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[str | None, str]:
+    requested_parent_id = str(config.get("parent_candidate_id") or "").strip()
+    if requested_parent_id:
+        requested = next((candidate for candidate in candidates if candidate["id"] == requested_parent_id), None)
+        if requested is not None:
+            return requested["id"], str(requested["compiled_prompt"])
+
+    frontier = [candidate for candidate in candidates if candidate["frontier_member"]]
+    pool = frontier or candidates
+    if pool:
+        seed = config.get("candidate_selection_seed")
+        rng = random.Random(seed) if seed is not None else random.Random()
+        selected = rng.choice(pool)
+        return selected["id"], str(selected["compiled_prompt"])
+
+    parent_candidate_id = config.get("active_candidate_id") or job.get("active_candidate_id")
+    base_prompt = (job.get("latest_system_prompt") or job.get("compiled_system_prompt") or "").strip()
+    return str(parent_candidate_id) if parent_candidate_id else None, base_prompt
 
 
 def _optimize_with_dspy_gepa(
@@ -160,7 +186,12 @@ def run_gepa_optimization(
 
     n = float(len(rollouts))
     objective_means = {key: value / n for key, value in objective_totals.items()}
-    base_prompt = (job.get("latest_system_prompt") or job.get("compiled_system_prompt") or "").strip()
+    existing_candidates = state_store.list_gepa_candidates_for_job(job_id)
+    parent_candidate_id, base_prompt = _select_parent_candidate(
+        job=job,
+        candidates=existing_candidates,
+        config=config,
+    )
     optimizer_backend = str(config.get("optimizer_backend", "dspy_gepa")).strip() or "dspy_gepa"
     if optimizer_backend == "dspy_gepa":
         try:
@@ -173,12 +204,11 @@ def run_gepa_optimization(
             append_event("INFO", "DSPy GEPA optimization completed.")
         except Exception as exc:  # noqa: BLE001
             append_event("WARN", f"DSPy GEPA unavailable; falling back to heuristic policy update ({exc}).")
-            compiled_prompt = _build_compiled_prompt(job.get("latest_system_prompt"), critiques)
+            compiled_prompt = _build_compiled_prompt(base_prompt, critiques)
             optimizer_backend = "heuristic_fallback"
     else:
-        compiled_prompt = _build_compiled_prompt(job.get("latest_system_prompt"), critiques)
+        compiled_prompt = _build_compiled_prompt(base_prompt, critiques)
 
-    parent_candidate_id = config.get("active_candidate_id") or job.get("active_candidate_id")
     parent_candidate_ids = [parent_candidate_id] if parent_candidate_id else []
     candidate_id = state_store.create_gepa_candidate(
         job_id=job_id,
@@ -188,7 +218,7 @@ def run_gepa_optimization(
         objective_scores=objective_means,
         created_by_run_id=run_id,
     )
-    state_store.set_candidate_frontier_membership(candidate_id, True)
+    frontier_snapshot = state_store.recompute_gepa_frontier_for_job(job_id)
     state_store.promote_job_candidate(job_id, candidate_id)
 
     checkpoint = {
@@ -201,7 +231,7 @@ def run_gepa_optimization(
         "compiled_prompt": compiled_prompt,
         "optimizer_backend": optimizer_backend,
         "objective_scores": objective_means,
-        "frontier_snapshot": [{"candidate_id": candidate_id, "frontier_member": True}],
+        "frontier_snapshot": frontier_snapshot,
         "created_at": _utc_now(),
         "rollout_scores": rollout_scores,
     }

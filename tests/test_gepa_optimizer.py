@@ -149,3 +149,61 @@ def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
     )
     checkpoint = json.loads((Path(run["artifact_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
     assert checkpoint["optimizer_backend"] == "heuristic_fallback"
+
+
+def test_run_gepa_optimization_uses_frontier_parent_candidate(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="frontier-parent",
+        description="Frontier parent selection check",
+        seed_system_prompt="Seed policy.",
+    )
+    rollout = _create_completed_rollout(
+        store,
+        job_id=job_id,
+        prompt="p1",
+        winner="right",
+        outcome="winner",
+        critique="Refined version has better atmosphere.",
+    )
+    seed_run_id = store.create_run(
+        run_type="gepa",
+        display_name="Existing candidate run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    parent_candidate_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="Parent policy",
+        compiled_prompt="Frontier parent policy.",
+        objective_scores={"preference_win": 0.8, "feedback_quality": 0.7},
+        created_by_run_id=seed_run_id,
+    )
+    store.set_candidate_frontier_membership(parent_candidate_id, True)
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA frontier-parent run",
+        config={
+            "job_id": job_id,
+            "minibatch_size": 1,
+            "selected_rollout_ids": [rollout],
+            "optimizer_backend": "heuristic",
+            "candidate_selection_seed": 0,
+        },
+    )
+    run = store.get_run(run_id)
+    assert run is not None
+
+    run_gepa_optimization(
+        run_id=run_id,
+        artifact_dir=Path(run["artifact_dir"]),
+        state_store=store,
+        config=json.loads((Path(run["artifact_dir"]) / "config.json").read_text(encoding="utf-8")),
+        append_event=lambda _level, _message: None,
+        is_cancel_requested=lambda: False,
+    )
+
+    checkpoint = json.loads((Path(run["artifact_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["parent_candidate_id"] == parent_candidate_id
+    assert checkpoint["compiled_prompt"].startswith("Frontier parent policy.")
+    assert any(item["candidate_id"] == checkpoint["new_candidate_id"] for item in checkpoint["frontier_snapshot"])

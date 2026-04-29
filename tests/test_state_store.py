@@ -522,6 +522,45 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert job["latest_system_prompt"] == "Use moody shadows and controlled highlights."
 
 
+def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="frontier",
+        description="frontier checks",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA frontier run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    weak_candidate = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="weak",
+        compiled_prompt="weak",
+        objective_scores={"preference_win": 0.2, "feedback_quality": 0.2},
+        created_by_run_id=run_id,
+    )
+    strong_candidate = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="strong",
+        compiled_prompt="strong",
+        objective_scores={"preference_win": 0.8, "feedback_quality": 0.8},
+        created_by_run_id=run_id,
+    )
+
+    snapshot = store.recompute_gepa_frontier_for_job(job_id)
+    membership = {item["candidate_id"]: item["frontier_member"] for item in snapshot}
+    assert membership[weak_candidate] is False
+    assert membership[strong_candidate] is True
+
+    candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
+    assert candidates[weak_candidate]["frontier_member"] is False
+    assert candidates[strong_candidate]["frontier_member"] is True
+
+
 def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(

@@ -1096,6 +1096,40 @@ class StateStore:
             )
             connection.commit()
 
+    def recompute_gepa_frontier_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        candidates = self.list_gepa_candidates_for_job(job_id)
+
+        def dominates(a: dict[str, float], b: dict[str, float]) -> bool:
+            keys = set(a) | set(b)
+            return (
+                all(float(a.get(key, 0.0)) >= float(b.get(key, 0.0)) for key in keys)
+                and any(float(a.get(key, 0.0)) > float(b.get(key, 0.0)) for key in keys)
+            )
+
+        frontier_ids: set[str] = set()
+        for candidate in candidates:
+            candidate_scores = candidate["objective_scores"]
+            is_dominated = any(
+                other["id"] != candidate["id"]
+                and dominates(other["objective_scores"], candidate_scores)
+                for other in candidates
+            )
+            if not is_dominated:
+                frontier_ids.add(str(candidate["id"]))
+
+        with self._connect() as connection:
+            for candidate in candidates:
+                connection.execute(
+                    "UPDATE gepa_candidates SET frontier_member = ? WHERE id = ?",
+                    (1 if candidate["id"] in frontier_ids else 0, candidate["id"]),
+                )
+            connection.commit()
+
+        return [
+            {"candidate_id": candidate["id"], "frontier_member": candidate["id"] in frontier_ids}
+            for candidate in candidates
+        ]
+
     def promote_job_candidate(self, job_id: str, candidate_id: str) -> None:
         with self._connect() as connection:
             job = connection.execute(
