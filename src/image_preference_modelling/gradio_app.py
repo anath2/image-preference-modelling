@@ -93,6 +93,11 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         prompt_llm_reason_state = gr.State(value="")
         baseline_path_state = gr.State(value="")
         candidate_path_state = gr.State(value="")
+        train_left_candidate_id_state = gr.State(value="")
+        train_right_candidate_id_state = gr.State(value="")
+        train_left_system_prompt_state = gr.State(value="")
+        train_right_system_prompt_state = gr.State(value="")
+        train_rollout_type_state = gr.State(value="baseline_candidate")
         session_id_state = gr.State(value="")
         active_job_id_state = gr.State(value="")
         active_rollout_id_state = gr.State(value="")
@@ -514,6 +519,42 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 f"Showing rollout `{selected_rollout}`{status_suffix}.",
             )
 
+        def _select_training_matchup(job: dict[str, Any]) -> dict[str, str | None]:
+            job_id = str(job["id"])
+            proposed = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["proposed"])
+            evaluated = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+            frontier = [candidate for candidate in evaluated if candidate["frontier_member"]]
+            if proposed:
+                right = proposed[0]
+                left = next((candidate for candidate in frontier if candidate["id"] != right["id"]), None)
+                if left is None:
+                    left = next((candidate for candidate in evaluated if candidate["id"] != right["id"]), None)
+                return {
+                    "rollout_type": "candidate_comparison" if left is not None else "baseline_candidate",
+                    "left_candidate_id": None if left is None else str(left["id"]),
+                    "right_candidate_id": str(right["id"]),
+                    "left_prompt": "" if left is None else str(left["compiled_prompt"]),
+                    "right_prompt": str(right["compiled_prompt"]),
+                }
+
+            active_candidate_id = str(job.get("active_candidate_id") or "").strip()
+            active_candidate = next(
+                (candidate for candidate in evaluated if candidate["id"] == active_candidate_id),
+                None,
+            )
+            right_prompt = (
+                str(active_candidate["compiled_prompt"])
+                if active_candidate is not None
+                else _resolve_active_system_prompt(job)
+            )
+            return {
+                "rollout_type": "baseline_candidate",
+                "left_candidate_id": None,
+                "right_candidate_id": active_candidate_id or None,
+                "left_prompt": "",
+                "right_prompt": right_prompt,
+            }
+
         def _generate_latest_prompt_check(
             prompt: str,
             active_job_id: str,
@@ -618,17 +659,35 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 message,
             )
 
-        def _generate_baseline(prompt: str, active_job_id: str) -> tuple[str | None, str, str]:
+        def _generate_baseline(
+            prompt: str,
+            active_job_id: str,
+        ) -> tuple[str | None, str, str, str, str, str, str, str]:
             cleaned_prompt = prompt.strip()
             if not cleaned_prompt:
-                return None, "", "Sample a prompt first."
+                return None, "", "", "", "", "", "baseline_candidate", "Sample a prompt first."
             if not active_job_id.strip():
-                return None, "", "Select and activate an aesthetic job first."
+                return None, "", "", "", "", "", "baseline_candidate", "Select and activate an aesthetic job first."
+            job = ctx.state_store.get_aesthetic_job(active_job_id.strip())
+            if job is None:
+                return None, "", "", "", "", "", "baseline_candidate", "Selected job is unavailable."
+            matchup = _select_training_matchup(job)
+            left_prompt = str(matchup["left_prompt"] or "")
+            right_prompt = str(matchup["right_prompt"] or "")
 
             settings = ImageGenerationModelSettings.from_env()
+            left_system_prompt = (
+                build_candidate_system_prompt(
+                    original_prompt=cleaned_prompt,
+                    regeneration_instructions=left_prompt,
+                )
+                if left_prompt
+                else None
+            )
             baseline_data_url = generate_image_from_openrouter(
                 cleaned_prompt,
                 settings,
+                system_prompt=left_system_prompt,
                 timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
             )
             baseline_path = save_generated_image(
@@ -639,9 +698,15 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             return (
                 str(baseline_path),
                 str(baseline_path),
+                str(matchup["left_candidate_id"] or ""),
+                str(matchup["right_candidate_id"] or ""),
+                left_system_prompt or "",
+                right_prompt,
+                str(matchup["rollout_type"] or "baseline_candidate"),
                 (
-                    "Baseline generated with system prompt: "
-                    f"`{_system_prompt_preview('')}`. Confirm candidate prompt and click `Generate Candidate`."
+                    "Left image generated with system prompt: "
+                    f"`{_system_prompt_preview(left_system_prompt or '')}`. "
+                    "Confirm right prompt and click `Generate Candidate`."
                 ),
             )
 
@@ -654,6 +719,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             prompt_llm_reason: str,
             baseline_path: str,
             active_job_id: str,
+            left_candidate_id: str,
+            right_candidate_id: str,
+            left_system_prompt: str,
+            rollout_type: str,
         ) -> tuple[str | None, str, str, str]:
             cleaned_prompt = prompt.strip()
             cleaned_reprompt = candidate_system_prompt.strip()
@@ -701,10 +770,15 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 intent_text=cleaned_prompt,
                 baseline_image_uri=str(preserved_baseline_path),
                 candidate_image_uri=str(candidate_path),
-                candidate_id=None,
+                candidate_id=right_candidate_id.strip() or None,
                 system_prompt=system_prompt,
                 baseline_system_prompt_snapshot=str(job.get("baseline_system_prompt") or ""),
                 latest_system_prompt_snapshot=str(job.get("latest_system_prompt") or ""),
+                rollout_type=rollout_type.strip() or "baseline_candidate",
+                left_candidate_id=left_candidate_id.strip() or None,
+                right_candidate_id=right_candidate_id.strip() or None,
+                left_system_prompt_snapshot=left_system_prompt.strip(),
+                right_system_prompt_snapshot=system_prompt,
                 prompt_category=prompt_category.strip() or None,
                 selection_mode=prompt_selection_mode.strip() or None,
                 llm_score=float(prompt_llm_score) if prompt_llm_score.strip() else None,
@@ -712,6 +786,18 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 generation_mode="text_only",
                 model_config={"image_model": settings.image_model},
             )
+            selected_right_candidate_id = right_candidate_id.strip()
+            if selected_right_candidate_id:
+                right_candidate = next(
+                    (
+                        candidate
+                        for candidate in ctx.state_store.list_gepa_candidates_for_job(active_job_id.strip())
+                        if candidate["id"] == selected_right_candidate_id
+                    ),
+                    None,
+                )
+                if right_candidate is not None and right_candidate["status"] == "proposed":
+                    ctx.state_store.update_gepa_candidate_status(selected_right_candidate_id, "evaluating")
             return (
                 str(candidate_path),
                 str(candidate_path),
@@ -766,6 +852,35 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 outcome=outcome,
             )
             ctx.state_store.mark_rollout_feedback_complete(active_rollout_id.strip(), comparison_id)
+            if active_job_id.strip():
+                rollout = next(
+                    (
+                        item
+                        for item in ctx.state_store.list_rollouts_for_job(active_job_id.strip(), limit=300)
+                        if item["id"] == active_rollout_id.strip()
+                    ),
+                    None,
+                )
+                if rollout is not None and rollout.get("rollout_type") == "candidate_comparison":
+                    left_candidate_id = rollout.get("left_candidate_id")
+                    right_candidate_id = rollout.get("right_candidate_id")
+                    if outcome == "winner" and winner_value == "left":
+                        ctx.state_store.update_candidate_feedback_stats(
+                            winner_candidate_id=left_candidate_id,
+                            loser_candidate_id=right_candidate_id,
+                        )
+                    elif outcome == "winner" and winner_value == "right":
+                        ctx.state_store.update_candidate_feedback_stats(
+                            winner_candidate_id=right_candidate_id,
+                            loser_candidate_id=left_candidate_id,
+                        )
+                    else:
+                        ctx.state_store.update_candidate_feedback_stats(
+                            winner_candidate_id=None,
+                            loser_candidate_id=None,
+                            tied_candidate_ids=[left_candidate_id, right_candidate_id],
+                        )
+                    ctx.state_store.recompute_gepa_frontier_for_job(active_job_id.strip())
             completed_count = "0"
             if active_job_id.strip():
                 completed_count = str(ctx.state_store.count_completed_rollouts_for_job(active_job_id.strip()))
@@ -857,7 +972,16 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         generate_baseline_btn.click(
             _generate_baseline,
             inputs=[sampled_prompt, active_job_id_state],
-            outputs=[baseline_image, baseline_path_state, workflow_status],
+            outputs=[
+                baseline_image,
+                baseline_path_state,
+                train_left_candidate_id_state,
+                train_right_candidate_id_state,
+                train_left_system_prompt_state,
+                candidate_prompt_text,
+                train_rollout_type_state,
+                workflow_status,
+            ],
         )
 
         generate_candidate_btn.click(
@@ -871,6 +995,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 prompt_llm_reason_state,
                 baseline_path_state,
                 active_job_id_state,
+                train_left_candidate_id_state,
+                train_right_candidate_id_state,
+                train_left_system_prompt_state,
+                train_rollout_type_state,
             ],
             outputs=[candidate_image, candidate_path_state, active_rollout_id_state, workflow_status],
         )
