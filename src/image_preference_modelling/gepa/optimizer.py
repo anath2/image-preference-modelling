@@ -39,8 +39,9 @@ def _select_parent_candidate(
         if requested is not None:
             return requested["id"], str(requested["compiled_prompt"])
 
-    frontier = [candidate for candidate in candidates if candidate["frontier_member"]]
-    pool = frontier or candidates
+    evaluated_candidates = [candidate for candidate in candidates if candidate.get("status") == "evaluated"]
+    frontier = [candidate for candidate in evaluated_candidates if candidate["frontier_member"]]
+    pool = frontier or evaluated_candidates
     if pool:
         seed = config.get("candidate_selection_seed")
         rng = random.Random(seed) if seed is not None else random.Random()
@@ -219,7 +220,7 @@ def run_gepa_optimization(
         created_by_run_id=run_id,
     )
     frontier_snapshot = state_store.recompute_gepa_frontier_for_job(job_id)
-    state_store.promote_job_candidate(job_id, candidate_id)
+    append_event("INFO", f"GEPA candidate {candidate_id} created as proposed; promotion requires evaluation.")
 
     checkpoint = {
         "run_id": run_id,
@@ -228,6 +229,8 @@ def run_gepa_optimization(
         "selected_rollout_ids": [str(r["id"]) for r in rollouts],
         "parent_candidate_id": parent_candidate_id,
         "new_candidate_id": candidate_id,
+        "new_candidate_status": "proposed",
+        "promoted_candidate": False,
         "compiled_prompt": compiled_prompt,
         "optimizer_backend": optimizer_backend,
         "objective_scores": objective_means,
