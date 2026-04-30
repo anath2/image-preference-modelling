@@ -1325,6 +1325,28 @@ class StateStore:
             )
             connection.commit()
 
+    def promote_best_frontier_candidate(self, job_id: str) -> str:
+        self.recompute_gepa_frontier_for_job(job_id)
+        candidates = [
+            candidate
+            for candidate in self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+            if candidate["frontier_member"]
+        ]
+        if not candidates:
+            raise ValueError(f"Aesthetic job {job_id} has no evaluated frontier candidates")
+
+        def ranking_key(candidate: dict[str, Any]) -> tuple[float, int, str]:
+            scores = candidate["objective_scores"]
+            return (
+                float(scores.get("candidate_win_rate", scores.get("preference_win", 0.0))),
+                int(candidate.get("evaluation_count") or 0),
+                str(candidate["created_at"]),
+            )
+
+        selected = max(candidates, key=ranking_key)
+        self.promote_job_candidate(job_id, str(selected["id"]))
+        return str(selected["id"])
+
     def _latest_completed_gepa_finished_at_for_job(
         self, connection: sqlite3.Connection, job_id: str
     ) -> str | None:

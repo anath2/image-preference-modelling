@@ -177,6 +177,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                     precision=0,
                 )
                 run_gepa_btn = gr.Button("Run GEPA Optimization")
+                promote_frontier_btn = gr.Button("Promote Best Frontier Candidate")
                 refresh_gepa_status_btn = gr.Button("Refresh GEPA Status")
                 show_gepa_logs_btn = gr.Button("Show GEPA Run Logs")
                 gepa_poll_timer = gr.Timer(value=2.0, active=False)
@@ -450,6 +451,24 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 for event in events
             ]
             return "\n".join(lines), f"Showing logs for `{selected_run}`."
+
+        def _promote_best_frontier_candidate(active_job_id: str) -> tuple[str, str, str, str]:
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return "", "", "", "Select and activate an aesthetic job first."
+            try:
+                candidate_id = ctx.state_store.promote_best_frontier_candidate(selected_job_id)
+            except ValueError as exc:
+                return "", "", "", str(exc)
+            job = ctx.state_store.get_aesthetic_job(selected_job_id)
+            if job is None:
+                return "", "", "", "Selected job is unavailable."
+            return (
+                str(job.get("latest_system_prompt") or ""),
+                str(job.get("baseline_system_prompt") or ""),
+                _resolve_active_system_prompt(job),
+                f"Promoted frontier candidate `{candidate_id}`.",
+            )
 
         def _refresh_inspector_jobs() -> tuple[gr.Dropdown, str]:
             jobs = ctx.state_store.list_aesthetic_jobs(include_archived=True)
@@ -1032,6 +1051,12 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 latest_gepa_run_id_state,
                 gepa_poll_timer,
             ],
+        )
+
+        promote_frontier_btn.click(
+            _promote_best_frontier_candidate,
+            inputs=[active_job_id_state],
+            outputs=[compiled_prompt_view, baseline_prompt_text, candidate_prompt_text, workflow_status],
         )
 
         refresh_gepa_status_btn.click(

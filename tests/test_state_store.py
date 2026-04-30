@@ -617,6 +617,12 @@ def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> N
     assert candidates[weak_candidate]["frontier_member"] is False
     assert candidates[strong_candidate]["frontier_member"] is True
 
+    promoted_id = store.promote_best_frontier_candidate(job_id)
+    assert promoted_id == strong_candidate
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    assert job["active_candidate_id"] == strong_candidate
+
 
 def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
