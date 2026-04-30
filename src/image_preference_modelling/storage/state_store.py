@@ -1214,6 +1214,34 @@ class StateStore:
                     """,
                     (candidate_id,),
                 )
+            affected_ids = sorted(set(candidate_ids))
+            for candidate_id in affected_ids:
+                row = connection.execute(
+                    """
+                    SELECT evaluation_count, win_count, tie_count
+                    FROM gepa_candidates
+                    WHERE id = ?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                evaluation_count = int(row["evaluation_count"] or 0)
+                win_count = int(row["win_count"] or 0)
+                tie_count = int(row["tie_count"] or 0)
+                win_rate = (
+                    (float(win_count) + 0.5 * float(tie_count)) / float(evaluation_count)
+                    if evaluation_count
+                    else 0.0
+                )
+                scores = {
+                    "candidate_win_rate": win_rate,
+                    "evaluation_coverage": min(1.0, float(evaluation_count) / 5.0),
+                }
+                connection.execute(
+                    "UPDATE gepa_candidates SET objective_scores_json = ? WHERE id = ?",
+                    (json.dumps(scores), candidate_id),
+                )
             connection.commit()
 
     def recompute_gepa_frontier_for_job(self, job_id: str) -> list[dict[str, Any]]:

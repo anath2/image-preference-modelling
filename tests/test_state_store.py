@@ -569,9 +569,12 @@ def test_candidate_feedback_stats_update_lifecycle_counts(tmp_path: Path) -> Non
     assert candidates[winner_id]["status"] == "evaluated"
     assert candidates[winner_id]["evaluation_count"] == 1
     assert candidates[winner_id]["win_count"] == 1
+    assert candidates[winner_id]["objective_scores"]["candidate_win_rate"] == 1.0
+    assert candidates[winner_id]["objective_scores"]["evaluation_coverage"] == 0.2
     assert candidates[loser_id]["status"] == "evaluated"
     assert candidates[loser_id]["evaluation_count"] == 1
     assert candidates[loser_id]["loss_count"] == 1
+    assert candidates[loser_id]["objective_scores"]["candidate_win_rate"] == 0.0
 
 
 def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
