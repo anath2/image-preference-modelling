@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 8
+    assert store.schema_version() == 9
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -330,7 +330,7 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 8
+    assert store.schema_version() == 9
 
     job = store.get_aesthetic_job("job_legacy")
     assert job is not None
@@ -508,10 +508,20 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert candidates[0]["parent_candidate_ids"] == []
     assert candidates[0]["objective_scores"]["preference_win"] == 0.8
     assert candidates[0]["frontier_member"] is False
+    assert candidates[0]["status"] == "proposed"
+    assert candidates[0]["evaluation_count"] == 0
+    assert candidates[0]["win_count"] == 0
+    assert candidates[0]["loss_count"] == 0
+    assert candidates[0]["tie_count"] == 0
 
+    with pytest.raises(ValueError, match="before it is evaluated"):
+        store.promote_job_candidate(job_id, candidate_id)
+
+    store.update_gepa_candidate_status(candidate_id, "evaluated")
     store.set_candidate_frontier_membership(candidate_id, True)
     updated_candidates = store.list_gepa_candidates_for_job(job_id)
     assert updated_candidates[0]["frontier_member"] is True
+    assert updated_candidates[0]["status"] == "evaluated"
 
     store.promote_job_candidate(job_id, candidate_id)
     job = store.get_aesthetic_job(job_id)
@@ -520,6 +530,48 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert job["compiled_system_prompt"] == "Use moody shadows and controlled highlights."
     assert job["baseline_system_prompt"] == "Increase contrast while preserving scene composition."
     assert job["latest_system_prompt"] == "Use moody shadows and controlled highlights."
+
+
+def test_candidate_feedback_stats_update_lifecycle_counts(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="candidate-stats",
+        description="stats checks",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA stats run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    winner_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="winner",
+        compiled_prompt="winner",
+        objective_scores={},
+        created_by_run_id=run_id,
+    )
+    loser_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="loser",
+        compiled_prompt="loser",
+        objective_scores={},
+        created_by_run_id=run_id,
+    )
+
+    store.update_candidate_feedback_stats(
+        winner_candidate_id=winner_id,
+        loser_candidate_id=loser_id,
+    )
+    candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
+    assert candidates[winner_id]["status"] == "evaluated"
+    assert candidates[winner_id]["evaluation_count"] == 1
+    assert candidates[winner_id]["win_count"] == 1
+    assert candidates[loser_id]["status"] == "evaluated"
+    assert candidates[loser_id]["evaluation_count"] == 1
+    assert candidates[loser_id]["loss_count"] == 1
 
 
 def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
@@ -541,6 +593,7 @@ def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> N
         compiled_prompt="weak",
         objective_scores={"preference_win": 0.2, "feedback_quality": 0.2},
         created_by_run_id=run_id,
+        status="evaluated",
     )
     strong_candidate = store.create_gepa_candidate(
         job_id=job_id,
@@ -549,6 +602,7 @@ def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> N
         compiled_prompt="strong",
         objective_scores={"preference_win": 0.8, "feedback_quality": 0.8},
         created_by_run_id=run_id,
+        status="evaluated",
     )
 
     snapshot = store.recompute_gepa_frontier_for_job(job_id)

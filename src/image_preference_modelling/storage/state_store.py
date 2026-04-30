@@ -20,7 +20,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -30,6 +30,7 @@ VALID_AESTHETIC_JOB_STATUSES = {"active", "archived"}
 VALID_ROLLOUT_STATUSES = {"generated", "feedback_complete"}
 VALID_ROLLOUT_TYPES = {"baseline_candidate", "candidate_comparison", "latest_prompt_check"}
 VALID_ROLLOUT_GENERATION_MODES = {"image_conditioned", "text_only"}
+VALID_GEPA_CANDIDATE_STATUSES = {"proposed", "evaluating", "evaluated", "archived"}
 DEFAULT_GEPA_ENABLE_THRESHOLD = 2
 
 
@@ -276,6 +277,10 @@ class StateStore:
             self._migrate_v7_to_v8(connection)
             current_version = 8
 
+        if current_version == 8:
+            self._migrate_v8_to_v9(connection)
+            current_version = 9
+
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unsupported schema version {current_version}; expected {SCHEMA_VERSION}"
@@ -505,6 +510,26 @@ class StateStore:
                 """
             )
         self._set_schema_version(connection, 8)
+
+    def _migrate_v8_to_v9(self, connection: sqlite3.Connection) -> None:
+        candidate_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(gepa_candidates)").fetchall()
+        }
+        if "status" not in candidate_columns:
+            connection.execute(
+                "ALTER TABLE gepa_candidates ADD COLUMN status TEXT NOT NULL DEFAULT 'evaluated'"
+            )
+        if "evaluation_count" not in candidate_columns:
+            connection.execute(
+                "ALTER TABLE gepa_candidates ADD COLUMN evaluation_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "win_count" not in candidate_columns:
+            connection.execute("ALTER TABLE gepa_candidates ADD COLUMN win_count INTEGER NOT NULL DEFAULT 0")
+        if "loss_count" not in candidate_columns:
+            connection.execute("ALTER TABLE gepa_candidates ADD COLUMN loss_count INTEGER NOT NULL DEFAULT 0")
+        if "tie_count" not in candidate_columns:
+            connection.execute("ALTER TABLE gepa_candidates ADD COLUMN tie_count INTEGER NOT NULL DEFAULT 0")
+        self._set_schema_version(connection, 9)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -1029,7 +1054,10 @@ class StateStore:
         compiled_prompt: str,
         objective_scores: dict[str, float],
         created_by_run_id: str | None,
+        status: str = "proposed",
     ) -> str:
+        if status not in VALID_GEPA_CANDIDATE_STATUSES:
+            raise ValueError(f"Unsupported GEPA candidate status: {status}")
         if self.get_aesthetic_job(job_id) is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
         if created_by_run_id is not None and self.get_run(created_by_run_id) is None:
@@ -1042,8 +1070,9 @@ class StateStore:
                 INSERT INTO gepa_candidates(
                     id, job_id, parent_candidate_ids_json, candidate_text,
                     compiled_prompt, objective_scores_json, frontier_member,
+                    status, evaluation_count, win_count, loss_count, tie_count,
                     created_by_run_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate_id,
@@ -1053,6 +1082,11 @@ class StateStore:
                     compiled_prompt,
                     json.dumps(objective_scores),
                     0,
+                    status,
+                    0,
+                    0,
+                    0,
+                    0,
                     created_by_run_id,
                     _utc_now(),
                 ),
@@ -1060,17 +1094,30 @@ class StateStore:
             connection.commit()
         return candidate_id
 
-    def list_gepa_candidates_for_job(self, job_id: str) -> list[dict[str, Any]]:
+    def list_gepa_candidates_for_job(
+        self, job_id: str, statuses: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        if statuses is not None:
+            invalid_statuses = [status for status in statuses if status not in VALID_GEPA_CANDIDATE_STATUSES]
+            if invalid_statuses:
+                raise ValueError(f"Unsupported GEPA candidate status: {invalid_statuses[0]}")
         with self._connect() as connection:
+            where_clause = "WHERE job_id = ?"
+            params: tuple[Any, ...] = (job_id,)
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                where_clause += f" AND status IN ({placeholders})"
+                params = (job_id, *statuses)
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, job_id, parent_candidate_ids_json, candidate_text, compiled_prompt,
-                       objective_scores_json, frontier_member, created_by_run_id, created_at
+                       objective_scores_json, frontier_member, status, evaluation_count,
+                       win_count, loss_count, tie_count, created_by_run_id, created_at
                 FROM gepa_candidates
-                WHERE job_id = ?
+                {where_clause}
                 ORDER BY created_at DESC
                 """,
-                (job_id,),
+                params,
             ).fetchall()
 
         results: list[dict[str, Any]] = []
@@ -1096,8 +1143,81 @@ class StateStore:
             )
             connection.commit()
 
+    def update_gepa_candidate_status(self, candidate_id: str, status: str) -> None:
+        if status not in VALID_GEPA_CANDIDATE_STATUSES:
+            raise ValueError(f"Unsupported GEPA candidate status: {status}")
+        with self._connect() as connection:
+            candidate = connection.execute(
+                "SELECT id FROM gepa_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"GEPA candidate {candidate_id} does not exist")
+            connection.execute(
+                "UPDATE gepa_candidates SET status = ? WHERE id = ?",
+                (status, candidate_id),
+            )
+            connection.commit()
+
+    def update_candidate_feedback_stats(
+        self,
+        *,
+        winner_candidate_id: str | None,
+        loser_candidate_id: str | None,
+        tied_candidate_ids: list[str] | None = None,
+    ) -> None:
+        tied_ids = [candidate_id for candidate_id in (tied_candidate_ids or []) if candidate_id]
+        with self._connect() as connection:
+            candidate_ids = [candidate_id for candidate_id in [winner_candidate_id, loser_candidate_id, *tied_ids] if candidate_id]
+            if candidate_ids:
+                placeholders = ", ".join("?" for _ in candidate_ids)
+                existing = {
+                    str(row["id"])
+                    for row in connection.execute(
+                        f"SELECT id FROM gepa_candidates WHERE id IN ({placeholders})",
+                        tuple(candidate_ids),
+                    ).fetchall()
+                }
+                missing = [candidate_id for candidate_id in candidate_ids if candidate_id not in existing]
+                if missing:
+                    raise ValueError(f"GEPA candidate {missing[0]} does not exist")
+            if winner_candidate_id:
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET evaluation_count = evaluation_count + 1,
+                        win_count = win_count + 1,
+                        status = 'evaluated'
+                    WHERE id = ?
+                    """,
+                    (winner_candidate_id,),
+                )
+            if loser_candidate_id:
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET evaluation_count = evaluation_count + 1,
+                        loss_count = loss_count + 1,
+                        status = 'evaluated'
+                    WHERE id = ?
+                    """,
+                    (loser_candidate_id,),
+                )
+            for candidate_id in tied_ids:
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET evaluation_count = evaluation_count + 1,
+                        tie_count = tie_count + 1,
+                        status = 'evaluated'
+                    WHERE id = ?
+                    """,
+                    (candidate_id,),
+                )
+            connection.commit()
+
     def recompute_gepa_frontier_for_job(self, job_id: str) -> list[dict[str, Any]]:
-        candidates = self.list_gepa_candidates_for_job(job_id)
+        candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
 
         def dominates(a: dict[str, float], b: dict[str, float]) -> bool:
             keys = set(a) | set(b)
@@ -1118,6 +1238,10 @@ class StateStore:
                 frontier_ids.add(str(candidate["id"]))
 
         with self._connect() as connection:
+            connection.execute(
+                "UPDATE gepa_candidates SET frontier_member = 0 WHERE job_id = ?",
+                (job_id,),
+            )
             for candidate in candidates:
                 connection.execute(
                     "UPDATE gepa_candidates SET frontier_member = ? WHERE id = ?",
@@ -1139,13 +1263,17 @@ class StateStore:
             if job is None:
                 raise ValueError(f"Aesthetic job {job_id} does not exist")
             candidate = connection.execute(
-                "SELECT id, job_id, compiled_prompt FROM gepa_candidates WHERE id = ?",
+                "SELECT id, job_id, compiled_prompt, status, frontier_member FROM gepa_candidates WHERE id = ?",
                 (candidate_id,),
             ).fetchone()
             if candidate is None:
                 raise ValueError(f"GEPA candidate {candidate_id} does not exist")
             if candidate["job_id"] != job_id:
                 raise ValueError("Cannot promote candidate for a different aesthetic job")
+            if candidate["status"] != "evaluated":
+                raise ValueError("Cannot promote a GEPA candidate before it is evaluated")
+            if not bool(candidate["frontier_member"]):
+                raise ValueError("Cannot promote a GEPA candidate that is not on the frontier")
             job_row = connection.execute(
                 "SELECT latest_system_prompt FROM aesthetic_jobs WHERE id = ?",
                 (job_id,),
