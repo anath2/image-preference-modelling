@@ -69,6 +69,8 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Latest GEPA Run Status" in labels
     assert "GEPA Run Logs" in labels
     assert "Latest Check Prompt" in labels
+    assert "Latest Check Baseline System Prompt" in labels
+    assert "Latest Check Candidate System Prompt" in labels
     assert "Latest Check Baseline" in labels
     assert "Latest Check Candidate" in labels
     assert "Prompt" in labels

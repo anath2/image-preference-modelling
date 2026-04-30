@@ -200,6 +200,14 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                     placeholder="Type a prompt to compare the latest job prompt against baseline.",
                 )
                 generate_latest_check_btn = gr.Button("Generate Latest Prompt Check")
+                latest_check_baseline_prompt = gr.Textbox(
+                    label="Latest Check Baseline System Prompt",
+                    interactive=False,
+                )
+                latest_check_candidate_prompt = gr.Textbox(
+                    label="Latest Check Candidate System Prompt",
+                    interactive=False,
+                )
                 with gr.Row():
                     latest_check_baseline_image = gr.Image(label="Latest Check Baseline", type="filepath")
                     latest_check_candidate_image = gr.Image(label="Latest Check Candidate", type="filepath")
@@ -509,20 +517,20 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         def _generate_latest_prompt_check(
             prompt: str,
             active_job_id: str,
-        ) -> tuple[str | None, str | None, str, str, str]:
+        ) -> tuple[str | None, str | None, str, str, str, str, str]:
             cleaned_prompt = prompt.strip()
             selected_job_id = active_job_id.strip()
             if not selected_job_id:
-                return None, None, "", "", "Select and activate an aesthetic job first."
+                return None, None, "", "", "", "", "Select and activate an aesthetic job first."
             if not cleaned_prompt:
-                return None, None, "", "", "Enter a prompt for the latest prompt check."
+                return None, None, "", "", "", "", "Enter a prompt for the latest prompt check."
             job = ctx.state_store.get_aesthetic_job(selected_job_id)
             if job is None:
-                return None, None, "", "", "Selected job is unavailable."
+                return None, None, "", "", "", "", "Selected job is unavailable."
 
             latest_prompt = _resolve_active_system_prompt(job)
             if not latest_prompt:
-                return None, None, "", "", "Selected job does not have a latest system prompt."
+                return None, None, "", "", "", "", "Selected job does not have a latest system prompt."
 
             settings = ImageGenerationModelSettings.from_env()
             rollout_id = f"rollout_{uuid.uuid4().hex[:10]}"
@@ -577,6 +585,8 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 str(candidate_path),
                 str(baseline_path),
                 str(candidate_path),
+                "<no system prompt>",
+                system_prompt,
                 f"Latest prompt check generated as rollout `{rollout_id}`.",
             )
 
@@ -936,6 +946,8 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 latest_check_candidate_image,
                 latest_check_baseline_path_state,
                 latest_check_candidate_path_state,
+                latest_check_baseline_prompt,
+                latest_check_candidate_prompt,
                 workflow_status,
             ],
         )
