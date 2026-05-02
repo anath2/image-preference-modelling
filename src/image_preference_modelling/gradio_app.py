@@ -691,8 +691,16 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
 
             best_candidate = ctx.state_store.get_best_training_candidate(selected_job_id)
             if best_candidate is None:
-                return None, None, "", "", "", "", "No evaluated training candidate has enough evidence yet."
+                return None, None, "", "", "", "", "No evaluated training candidate is available yet."
             best_prompt = str(best_candidate["compiled_prompt"])
+            evaluation_count = int(best_candidate.get("evaluation_count") or 0)
+            confidence = float(best_candidate.get("confidence") or 0.0)
+            evidence_note = (
+                f"Evidence is limited ({evaluation_count} eval(s), confidence {confidence:.2f}); "
+                "use this as a sanity check, not a promotion signal."
+                if evaluation_count < 3 or confidence < 0.5
+                else f"Evidence looks stronger ({evaluation_count} eval(s), confidence {confidence:.2f})."
+            )
 
             settings = ImageGenerationModelSettings.from_env()
             rollout_id = f"rollout_{uuid.uuid4().hex[:10]}"
@@ -749,7 +757,10 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 str(candidate_path),
                 "<no system prompt>",
                 system_prompt,
-                f"Best candidate check generated as rollout `{rollout_id}` using `{best_candidate['id']}`.",
+                (
+                    f"Best candidate check generated as rollout `{rollout_id}` using `{best_candidate['id']}`. "
+                    f"{evidence_note}"
+                ),
             )
 
         def _sample_prompt(active_job_id: str) -> tuple[str, str, str, str, str, str]:

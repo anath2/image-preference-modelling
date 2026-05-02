@@ -1478,8 +1478,8 @@ class StateStore:
         self,
         job_id: str,
         *,
-        min_evaluations: int = 3,
-        min_confidence: float = 0.5,
+        min_evaluations: int = 1,
+        min_confidence: float = 0.0,
     ) -> dict[str, Any] | None:
         candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
         eligible = [

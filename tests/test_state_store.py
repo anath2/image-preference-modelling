@@ -638,6 +638,42 @@ def test_archive_pending_gepa_candidates_for_job_only_archives_pending(tmp_path:
     assert store.count_pending_gepa_candidates_for_job(job_id) == 0
 
 
+def test_best_training_candidate_allows_limited_evidence_for_sanity_check(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="best-check",
+        description="best candidate check",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="Mutation run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    candidate_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="candidate",
+        compiled_prompt="candidate",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="evaluated",
+    )
+    store.update_candidate_feedback_stats(
+        winner_candidate_id=candidate_id,
+        loser_candidate_id=None,
+        winner_margin=0.7,
+        critique_confidence=0.8,
+    )
+
+    selected = store.get_best_training_candidate(job_id)
+
+    assert selected is not None
+    assert selected["id"] == candidate_id
+    assert selected["evaluation_count"] == 1
+    assert selected["confidence"] < 0.5
+
+
 def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(
