@@ -7,6 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from image_preference_modelling.gepa.reward import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_ELO,
+    DEFAULT_SCORE,
+    blended_candidate_score,
+    confidence_from_evidence,
+    pairwise_elo_update,
+)
 from image_preference_modelling.storage.contracts import (
     RatingOutcome,
     RunStatus,
@@ -20,12 +28,12 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
 VALID_RATING_SESSION_STATUSES = {"active", "archived"}
-VALID_RATING_OUTCOMES = {"winner", "both_good", "both_bad", "cant_decide"}
+VALID_RATING_OUTCOMES = {"winner", "no_clear_winner", "both_good", "both_bad", "cant_decide"}
 VALID_AESTHETIC_JOB_STATUSES = {"active", "archived"}
 VALID_ROLLOUT_STATUSES = {"generated", "feedback_complete"}
 VALID_ROLLOUT_TYPES = {"baseline_candidate", "candidate_comparison", "latest_prompt_check"}
@@ -234,6 +242,10 @@ class StateStore:
                 compiled_prompt TEXT NOT NULL,
                 objective_scores_json TEXT NOT NULL,
                 frontier_member INTEGER NOT NULL DEFAULT 0,
+                elo REAL NOT NULL DEFAULT 1000.0,
+                score REAL NOT NULL DEFAULT 0.5,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                judge_metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_by_run_id TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(job_id) REFERENCES aesthetic_jobs(id),
@@ -280,6 +292,10 @@ class StateStore:
         if current_version == 8:
             self._migrate_v8_to_v9(connection)
             current_version = 9
+
+        if current_version == 9:
+            self._migrate_v9_to_v10(connection)
+            current_version = 10
 
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
@@ -530,6 +546,28 @@ class StateStore:
         if "tie_count" not in candidate_columns:
             connection.execute("ALTER TABLE gepa_candidates ADD COLUMN tie_count INTEGER NOT NULL DEFAULT 0")
         self._set_schema_version(connection, 9)
+
+    def _migrate_v9_to_v10(self, connection: sqlite3.Connection) -> None:
+        candidate_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(gepa_candidates)").fetchall()
+        }
+        if "elo" not in candidate_columns:
+            connection.execute(
+                f"ALTER TABLE gepa_candidates ADD COLUMN elo REAL NOT NULL DEFAULT {DEFAULT_ELO}"
+            )
+        if "score" not in candidate_columns:
+            connection.execute(
+                f"ALTER TABLE gepa_candidates ADD COLUMN score REAL NOT NULL DEFAULT {DEFAULT_SCORE}"
+            )
+        if "confidence" not in candidate_columns:
+            connection.execute(
+                f"ALTER TABLE gepa_candidates ADD COLUMN confidence REAL NOT NULL DEFAULT {DEFAULT_CONFIDENCE}"
+            )
+        if "judge_metadata_json" not in candidate_columns:
+            connection.execute(
+                "ALTER TABLE gepa_candidates ADD COLUMN judge_metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        self._set_schema_version(connection, 10)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -1070,9 +1108,10 @@ class StateStore:
                 INSERT INTO gepa_candidates(
                     id, job_id, parent_candidate_ids_json, candidate_text,
                     compiled_prompt, objective_scores_json, frontier_member,
+                    elo, score, confidence, judge_metadata_json,
                     status, evaluation_count, win_count, loss_count, tie_count,
                     created_by_run_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate_id,
@@ -1082,6 +1121,10 @@ class StateStore:
                     compiled_prompt,
                     json.dumps(objective_scores),
                     0,
+                    DEFAULT_ELO,
+                    DEFAULT_SCORE,
+                    DEFAULT_CONFIDENCE,
+                    json.dumps({}),
                     status,
                     0,
                     0,
@@ -1112,7 +1155,8 @@ class StateStore:
                 f"""
                 SELECT id, job_id, parent_candidate_ids_json, candidate_text, compiled_prompt,
                        objective_scores_json, frontier_member, status, evaluation_count,
-                       win_count, loss_count, tie_count, created_by_run_id, created_at
+                       win_count, loss_count, tie_count, elo, score, confidence,
+                       judge_metadata_json, created_by_run_id, created_at
                 FROM gepa_candidates
                 {where_clause}
                 ORDER BY created_at DESC
@@ -1125,6 +1169,7 @@ class StateStore:
             item = dict(row)
             item["parent_candidate_ids"] = json.loads(item.pop("parent_candidate_ids_json"))
             item["objective_scores"] = json.loads(item.pop("objective_scores_json"))
+            item["judge_metadata"] = json.loads(item.pop("judge_metadata_json") or "{}")
             item["frontier_member"] = bool(item["frontier_member"])
             results.append(item)
         return results
@@ -1165,6 +1210,9 @@ class StateStore:
         winner_candidate_id: str | None,
         loser_candidate_id: str | None,
         tied_candidate_ids: list[str] | None = None,
+        winner_margin: float = 1.0,
+        critique_confidence: float = 1.0,
+        judge_metadata: dict[str, Any] | None = None,
     ) -> None:
         tied_ids = [candidate_id for candidate_id in (tied_candidate_ids or []) if candidate_id]
         with self._connect() as connection:
@@ -1181,6 +1229,28 @@ class StateStore:
                 missing = [candidate_id for candidate_id in candidate_ids if candidate_id not in existing]
                 if missing:
                     raise ValueError(f"GEPA candidate {missing[0]} does not exist")
+            if winner_candidate_id and loser_candidate_id:
+                rows = {
+                    str(row["id"]): row
+                    for row in connection.execute(
+                        "SELECT id, elo FROM gepa_candidates WHERE id IN (?, ?)",
+                        (winner_candidate_id, loser_candidate_id),
+                    ).fetchall()
+                }
+                elo_update = pairwise_elo_update(
+                    left_elo=float(rows[winner_candidate_id]["elo"]),
+                    right_elo=float(rows[loser_candidate_id]["elo"]),
+                    winner="left",
+                    winner_margin=winner_margin,
+                )
+                connection.execute(
+                    "UPDATE gepa_candidates SET elo = ? WHERE id = ?",
+                    (elo_update.left_elo, winner_candidate_id),
+                )
+                connection.execute(
+                    "UPDATE gepa_candidates SET elo = ? WHERE id = ?",
+                    (elo_update.right_elo, loser_candidate_id),
+                )
             if winner_candidate_id:
                 connection.execute(
                     """
@@ -1218,7 +1288,7 @@ class StateStore:
             for candidate_id in affected_ids:
                 row = connection.execute(
                     """
-                    SELECT evaluation_count, win_count, tie_count
+                    SELECT evaluation_count, win_count, tie_count, elo, judge_metadata_json
                     FROM gepa_candidates
                     WHERE id = ?
                     """,
@@ -1229,6 +1299,33 @@ class StateStore:
                 evaluation_count = int(row["evaluation_count"] or 0)
                 win_count = int(row["win_count"] or 0)
                 tie_count = int(row["tie_count"] or 0)
+                elo = float(row["elo"] or DEFAULT_ELO)
+                judge_summary = self._updated_judge_summary(
+                    json.loads(row["judge_metadata_json"] or "{}"),
+                    winner_margin=winner_margin if candidate_id in {winner_candidate_id, loser_candidate_id} else 0.0,
+                    critique_confidence=critique_confidence,
+                    judge_metadata=judge_metadata,
+                )
+                judge_count = int(judge_summary.get("judge_count") or 0)
+                avg_confidence = (
+                    float(judge_summary.get("critique_confidence_total") or 0.0) / float(judge_count)
+                    if judge_count
+                    else 0.0
+                )
+                avg_margin = (
+                    float(judge_summary.get("winner_margin_total") or 0.0) / float(judge_count)
+                    if judge_count
+                    else 0.0
+                )
+                confidence = confidence_from_evidence(
+                    evaluation_count=evaluation_count,
+                    average_critique_confidence=avg_confidence,
+                )
+                blended_score = blended_candidate_score(
+                    elo=elo,
+                    confidence=confidence,
+                    average_margin_quality=avg_margin,
+                )
                 win_rate = (
                     (float(win_count) + 0.5 * float(tie_count)) / float(evaluation_count)
                     if evaluation_count
@@ -1237,12 +1334,42 @@ class StateStore:
                 scores = {
                     "candidate_win_rate": win_rate,
                     "evaluation_coverage": min(1.0, float(evaluation_count) / 5.0),
+                    "human_preference": win_rate,
+                    "evaluation_confidence": confidence,
+                    "critique_margin": avg_margin,
+                    "blended_score": blended_score,
                 }
                 connection.execute(
-                    "UPDATE gepa_candidates SET objective_scores_json = ? WHERE id = ?",
-                    (json.dumps(scores), candidate_id),
+                    """
+                    UPDATE gepa_candidates
+                    SET objective_scores_json = ?, score = ?, confidence = ?, judge_metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(scores), blended_score, confidence, json.dumps(judge_summary), candidate_id),
                 )
             connection.commit()
+
+    def _updated_judge_summary(
+        self,
+        existing: dict[str, Any],
+        *,
+        winner_margin: float,
+        critique_confidence: float,
+        judge_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        summary = dict(existing)
+        summary["judge_count"] = int(summary.get("judge_count") or 0) + 1
+        summary["winner_margin_total"] = float(summary.get("winner_margin_total") or 0.0) + max(
+            0.0, min(1.0, float(winner_margin))
+        )
+        summary["critique_confidence_total"] = float(
+            summary.get("critique_confidence_total") or 0.0
+        ) + max(0.0, min(1.0, float(critique_confidence)))
+        if judge_metadata:
+            recent = list(summary.get("recent_judgements") or [])
+            recent.append(judge_metadata)
+            summary["recent_judgements"] = recent[-5:]
+        return summary
 
     def recompute_gepa_frontier_for_job(self, job_id: str) -> list[dict[str, Any]]:
         candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
@@ -1338,7 +1465,7 @@ class StateStore:
         def ranking_key(candidate: dict[str, Any]) -> tuple[float, int, str]:
             scores = candidate["objective_scores"]
             return (
-                float(scores.get("candidate_win_rate", scores.get("preference_win", 0.0))),
+                float(candidate.get("score") or scores.get("blended_score", 0.0)),
                 int(candidate.get("evaluation_count") or 0),
                 str(candidate["created_at"]),
             )
@@ -1346,6 +1473,64 @@ class StateStore:
         selected = max(candidates, key=ranking_key)
         self.promote_job_candidate(job_id, str(selected["id"]))
         return str(selected["id"])
+
+    def get_best_training_candidate(
+        self,
+        job_id: str,
+        *,
+        min_evaluations: int = 3,
+        min_confidence: float = 0.5,
+    ) -> dict[str, Any] | None:
+        candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+        eligible = [
+            candidate
+            for candidate in candidates
+            if int(candidate.get("evaluation_count") or 0) >= min_evaluations
+            and float(candidate.get("confidence") or 0.0) >= min_confidence
+        ]
+        if not eligible:
+            return None
+
+        def ranking_key(candidate: dict[str, Any]) -> tuple[float, float, float, str]:
+            return (
+                float(candidate.get("score") or 0.0),
+                float(candidate.get("elo") or DEFAULT_ELO),
+                float(candidate.get("confidence") or 0.0),
+                str(candidate["created_at"]),
+            )
+
+        return max(eligible, key=ranking_key)
+
+    def count_pending_gepa_candidates_for_job(self, job_id: str) -> int:
+        with self._connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM gepa_candidates
+                WHERE job_id = ? AND status IN ('proposed', 'evaluating')
+                """,
+                (job_id,),
+            ).fetchone()[0]
+        return int(count or 0)
+
+    def count_active_gepa_runs_for_job(self, job_id: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT config_json
+                FROM runs
+                WHERE run_type = 'gepa' AND status IN ('queued', 'running')
+                """
+            ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                config = json.loads(row["config_json"])
+            except json.JSONDecodeError:
+                continue
+            if str(config.get("job_id") or "").strip() == job_id:
+                count += 1
+        return count
 
     def _latest_completed_gepa_finished_at_for_job(
         self, connection: sqlite3.Connection, job_id: str
