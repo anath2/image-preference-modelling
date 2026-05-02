@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 9
+    assert store.schema_version() == 10
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -330,7 +330,7 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 9
+    assert store.schema_version() == 10
 
     job = store.get_aesthetic_job("job_legacy")
     assert job is not None
@@ -513,6 +513,10 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert candidates[0]["win_count"] == 0
     assert candidates[0]["loss_count"] == 0
     assert candidates[0]["tie_count"] == 0
+    assert candidates[0]["elo"] == 1000.0
+    assert candidates[0]["score"] == 0.5
+    assert candidates[0]["confidence"] == 0.0
+    assert candidates[0]["judge_metadata"] == {}
 
     with pytest.raises(ValueError, match="before it is evaluated"):
         store.promote_job_candidate(job_id, candidate_id)
@@ -564,16 +568,23 @@ def test_candidate_feedback_stats_update_lifecycle_counts(tmp_path: Path) -> Non
     store.update_candidate_feedback_stats(
         winner_candidate_id=winner_id,
         loser_candidate_id=loser_id,
+        winner_margin=0.5,
+        critique_confidence=0.8,
+        judge_metadata={"alignment_notes": "winner better follows the brief"},
     )
     candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
     assert candidates[winner_id]["status"] == "evaluated"
     assert candidates[winner_id]["evaluation_count"] == 1
     assert candidates[winner_id]["win_count"] == 1
+    assert candidates[winner_id]["elo"] > 1000.0
+    assert candidates[winner_id]["score"] > candidates[loser_id]["score"]
+    assert candidates[winner_id]["confidence"] == pytest.approx(0.16)
     assert candidates[winner_id]["objective_scores"]["candidate_win_rate"] == 1.0
     assert candidates[winner_id]["objective_scores"]["evaluation_coverage"] == 0.2
     assert candidates[loser_id]["status"] == "evaluated"
     assert candidates[loser_id]["evaluation_count"] == 1
     assert candidates[loser_id]["loss_count"] == 1
+    assert candidates[loser_id]["elo"] < 1000.0
     assert candidates[loser_id]["objective_scores"]["candidate_win_rate"] == 0.0
 
 
