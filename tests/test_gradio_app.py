@@ -43,8 +43,8 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     )
 
     assert "Sample Prompt" in buttons
-    assert "Generate Baseline" in buttons
-    assert "Generate Candidate" in buttons
+    assert "Prepare Matchup" in buttons
+    assert "Generate Left / Right Images" in buttons
     assert "Submit Score" in buttons
     assert "Create Job" in buttons
     assert "Update Selected Job" in buttons
@@ -75,18 +75,20 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Latest Check Baseline" in labels
     assert "Latest Check Candidate" in labels
     assert "Prompt" in labels
-    assert "Baseline System Prompt" in labels
-    assert "Candidate System Prompt" in labels
+    assert "Left Candidate" in labels
+    assert "Right Candidate" in labels
+    assert "Left System Prompt" in labels
+    assert "Right System Prompt" in labels
     assert "Inspect Job" in labels
     assert "Rollout" in labels
     assert "Rollout Metadata" in labels
     assert "Inspector Baseline" in labels
     assert "Inspector Candidate" in labels
-    assert "Baseline" in labels
-    assert "Candidate" in labels
+    assert "Left" in labels
+    assert "Right" in labels
     assert tuple(choice[0] for choice in winner_radio.choices) == (
-        "baseline",
-        "candidate",
+        "left",
+        "right",
         "both_good",
         "both_bad",
         "cant_decide",
@@ -98,6 +100,8 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     [
         ("baseline", ("left", "winner")),
         ("candidate", ("right", "winner")),
+        ("left", ("left", "winner")),
+        ("right", ("right", "winner")),
         ("both_good", (None, "both_good")),
         ("both_bad", (None, "both_bad")),
         ("cant_decide", (None, "cant_decide")),
