@@ -53,11 +53,11 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Load Rollouts" in buttons
     assert "Use Selected Job" in buttons
     assert "Refresh Jobs" in buttons
-    assert "Run GEPA Optimization" in buttons
+    assert "Generate Mutation Now" in buttons
     assert "Promote Best Frontier Candidate" in buttons
-    assert "Refresh GEPA Status" in buttons
-    assert "Show GEPA Run Logs" in buttons
-    assert "Generate Latest Prompt Check" in buttons
+    assert "Refresh Mutation Status" in buttons
+    assert "Show Mutation Logs" in buttons
+    assert "Generate Best Candidate Check" in buttons
     assert "Active Job" in labels
     assert "Selected Job Name" in labels
     assert "Latest System Prompt" in labels
@@ -66,14 +66,14 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Guided Sampling Category" in labels
     assert "GEPA Enable Threshold" in labels
     assert "Completed Feedback Count" in labels
-    assert "GEPA Minibatch Size" in labels
-    assert "Latest GEPA Run Status" in labels
-    assert "GEPA Run Logs" in labels
-    assert "Latest Check Prompt" in labels
-    assert "Latest Check Baseline System Prompt" in labels
-    assert "Latest Check Candidate System Prompt" in labels
-    assert "Latest Check Baseline" in labels
-    assert "Latest Check Candidate" in labels
+    assert "Mutation Feedback Batch Size" in labels
+    assert "Latest Mutation Run Status" in labels
+    assert "Mutation Run Logs" in labels
+    assert "Best Candidate Check Prompt" in labels
+    assert "Best Check Baseline System Prompt" in labels
+    assert "Best Check Candidate System Prompt" in labels
+    assert "Best Check Baseline" in labels
+    assert "Best Check Candidate" in labels
     assert "Prompt" in labels
     assert "Left Candidate" in labels
     assert "Right Candidate" in labels
@@ -89,9 +89,7 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert tuple(choice[0] for choice in winner_radio.choices) == (
         "left",
         "right",
-        "both_good",
-        "both_bad",
-        "cant_decide",
+        "no_clear_winner",
     )
 
 
@@ -102,9 +100,10 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
         ("candidate", ("right", "winner")),
         ("left", ("left", "winner")),
         ("right", ("right", "winner")),
-        ("both_good", (None, "both_good")),
-        ("both_bad", (None, "both_bad")),
-        ("cant_decide", (None, "cant_decide")),
+        ("no_clear_winner", (None, "no_clear_winner")),
+        ("both_good", (None, "no_clear_winner")),
+        ("both_bad", (None, "no_clear_winner")),
+        ("cant_decide", (None, "no_clear_winner")),
     ],
 )
 def test_winner_to_storage_outcome_mappings(winner: str, expected: tuple[str | None, str]) -> None:
@@ -122,7 +121,7 @@ def test_build_gepa_run_config_includes_job_and_minibatch() -> None:
     assert config["job_id"] == "job_123"
     assert config["minibatch_size"] == 3
     assert config["selected_rollout_ids"] == ["rollout_1", "rollout_2", "rollout_3"]
-    assert config["optimizer_backend"] == "dspy_gepa"
+    assert config["optimizer_backend"] == "prompt_mutation"
 
 
 def test_resolve_active_system_prompt_prefers_compiled_prompt() -> None:

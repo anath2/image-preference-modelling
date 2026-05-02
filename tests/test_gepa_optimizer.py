@@ -97,7 +97,8 @@ def test_run_gepa_optimization_writes_checkpoint_and_proposes_candidate(tmp_path
     assert "new_candidate_id" in checkpoint
     assert checkpoint["new_candidate_status"] == "proposed"
     assert checkpoint["promoted_candidate"] is False
-    assert checkpoint["optimizer_backend"] in {"dspy_gepa", "heuristic_fallback"}
+    assert checkpoint["optimizer_backend"] in {"llm_mutation", "heuristic_fallback"}
+    assert "mutation_metadata" in checkpoint
 
     job = store.get_aesthetic_job(job_id)
     assert job is not None
@@ -111,11 +112,10 @@ def test_run_gepa_optimization_writes_checkpoint_and_proposes_candidate(tmp_path
     assert new_candidate["frontier_member"] is False
 
 
-def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
+def test_run_gepa_optimization_falls_back_when_prompt_model_not_configured(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("DSPY_MODEL", raising=False)
     monkeypatch.delenv("PROMPT_MODEL", raising=False)
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(
@@ -138,8 +138,8 @@ def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
             "job_id": job_id,
             "minibatch_size": 1,
             "selected_rollout_ids": [rollout],
-            "optimizer_backend": "dspy_gepa",
-            "dspy_model": "",
+            "optimizer_backend": "prompt_mutation",
+            "prompt_model": "",
             "openrouter_api_key": "",
         },
     )
@@ -194,8 +194,10 @@ def test_run_gepa_optimization_uses_frontier_parent_candidate(tmp_path: Path) ->
             "job_id": job_id,
             "minibatch_size": 1,
             "selected_rollout_ids": [rollout],
-            "optimizer_backend": "heuristic",
+            "optimizer_backend": "prompt_mutation",
             "candidate_selection_seed": 0,
+            "prompt_model": "",
+            "openrouter_api_key": "",
         },
     )
     run = store.get_run(run_id)
