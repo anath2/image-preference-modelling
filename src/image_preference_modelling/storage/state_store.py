@@ -1513,6 +1513,21 @@ class StateStore:
             ).fetchone()[0]
         return int(count or 0)
 
+    def archive_pending_gepa_candidates_for_job(self, job_id: str) -> int:
+        if self.get_aesthetic_job(job_id) is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE gepa_candidates
+                SET status = 'archived'
+                WHERE job_id = ? AND status IN ('proposed', 'evaluating')
+                """,
+                (job_id,),
+            )
+            connection.commit()
+        return int(cursor.rowcount or 0)
+
     def count_active_gepa_runs_for_job(self, job_id: str) -> int:
         with self._connect() as connection:
             rows = connection.execute(

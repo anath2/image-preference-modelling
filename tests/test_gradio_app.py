@@ -54,6 +54,7 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Use Selected Job" in buttons
     assert "Refresh Jobs" in buttons
     assert "Generate Mutation Now" in buttons
+    assert "Archive Pending Candidates" in buttons
     assert "Promote Best Frontier Candidate" in buttons
     assert "Refresh Mutation Status" in buttons
     assert "Show Mutation Logs" in buttons

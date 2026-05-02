@@ -588,6 +588,56 @@ def test_candidate_feedback_stats_update_lifecycle_counts(tmp_path: Path) -> Non
     assert candidates[loser_id]["objective_scores"]["candidate_win_rate"] == 0.0
 
 
+def test_archive_pending_gepa_candidates_for_job_only_archives_pending(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="archive-pending",
+        description="archive checks",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="Mutation run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    proposed_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="proposed",
+        compiled_prompt="proposed",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="proposed",
+    )
+    evaluating_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="evaluating",
+        compiled_prompt="evaluating",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="evaluating",
+    )
+    evaluated_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="evaluated",
+        compiled_prompt="evaluated",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="evaluated",
+    )
+
+    assert store.count_pending_gepa_candidates_for_job(job_id) == 2
+    assert store.archive_pending_gepa_candidates_for_job(job_id) == 2
+
+    candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
+    assert candidates[proposed_id]["status"] == "archived"
+    assert candidates[evaluating_id]["status"] == "archived"
+    assert candidates[evaluated_id]["status"] == "evaluated"
+    assert store.count_pending_gepa_candidates_for_job(job_id) == 0
+
+
 def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(

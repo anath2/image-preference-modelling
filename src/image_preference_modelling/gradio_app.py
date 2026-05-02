@@ -183,6 +183,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                     precision=0,
                 )
                 run_gepa_btn = gr.Button("Generate Mutation Now")
+                archive_pending_candidates_btn = gr.Button("Archive Pending Candidates")
                 promote_frontier_btn = gr.Button("Promote Best Frontier Candidate")
                 refresh_gepa_status_btn = gr.Button("Refresh Mutation Status")
                 show_gepa_logs_btn = gr.Button("Show Mutation Logs")
@@ -436,6 +437,18 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 gr.update(active=True),
             )
 
+        def _archive_pending_candidates(active_job_id: str) -> tuple[str, str, str, str, Any]:
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return "Select and activate an aesthetic job first.", "No mutation run yet.", "0", "", gr.update(active=False)
+            archived_count = ctx.state_store.archive_pending_gepa_candidates_for_job(selected_job_id)
+            completed_count = str(ctx.state_store.count_completed_rollouts_for_job(selected_job_id))
+            if archived_count == 0:
+                message = "No pending candidates to archive."
+            else:
+                message = f"Archived {archived_count} pending candidate(s). Mutation can resume when the feedback gate is ready."
+            return message, "No mutation run yet.", completed_count, "", gr.update(active=False)
+
         def _refresh_gepa_status(
             run_id: str,
             active_job_id: str,
@@ -587,10 +600,12 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
         def _select_training_matchup(job: dict[str, Any]) -> dict[str, str | None]:
             job_id = str(job["id"])
             proposed = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["proposed"])
+            evaluating = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["evaluating"])
             evaluated = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
             frontier = [candidate for candidate in evaluated if candidate["frontier_member"]]
-            if proposed:
-                right = random.choice(proposed)
+            pending = proposed or evaluating
+            if pending:
+                right = random.choice(pending)
                 left_pool = [candidate for candidate in frontier if candidate["id"] != right["id"]]
                 if not left_pool:
                     left_pool = [candidate for candidate in evaluated if candidate["id"] != right["id"]]
@@ -1207,6 +1222,22 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 latest_gepa_run_id_state,
                 gepa_poll_timer,
             ],
+        )
+
+        archive_pending_candidates_btn.click(
+            _archive_pending_candidates,
+            inputs=[active_job_id_state],
+            outputs=[
+                workflow_status,
+                latest_gepa_run_status,
+                completed_feedback_count,
+                latest_gepa_run_id_state,
+                gepa_poll_timer,
+            ],
+        ).then(
+            _gepa_button_state,
+            inputs=[active_job_id_state],
+            outputs=[run_gepa_btn, workflow_status, latest_gepa_run_status, latest_gepa_run_id_state, gepa_poll_timer],
         )
 
         promote_frontier_btn.click(
