@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 7
+    assert store.schema_version() == 10
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -330,7 +330,7 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 7
+    assert store.schema_version() == 10
 
     job = store.get_aesthetic_job("job_legacy")
     assert job is not None
@@ -339,13 +339,20 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
 
     with sqlite3.connect(db_path) as connection:
         row = connection.execute(
-            "SELECT candidate_image_uri, system_prompt, generation_mode FROM rollouts WHERE id = ?",
+            """
+            SELECT candidate_image_uri, system_prompt, generation_mode, rollout_type,
+                   right_system_prompt_snapshot
+            FROM rollouts
+            WHERE id = ?
+            """,
             ("rollout_legacy",),
         ).fetchone()
     assert row is not None
     assert row[0] == "refined.png"
     assert row[1] == "legacy refinement"
     assert row[2] == "image_conditioned"
+    assert row[3] == "baseline_candidate"
+    assert row[4] == "legacy refinement"
 
 
 def test_aesthetic_job_crud_and_policy_update(tmp_path: Path) -> None:
@@ -412,12 +419,50 @@ def test_create_rollout_and_mark_feedback_complete(tmp_path: Path) -> None:
     assert completed[0]["comparison_id"] == comparison_id
     assert completed[0]["candidate_image_uri"] == "candidate.png"
     assert completed[0]["system_prompt"] == "Enhance natural warm tones."
+    assert completed[0]["rollout_type"] == "baseline_candidate"
+    assert completed[0]["left_candidate_id"] is None
+    assert completed[0]["right_candidate_id"] is None
+    assert completed[0]["left_system_prompt_snapshot"] == ""
+    assert completed[0]["right_system_prompt_snapshot"] == "Enhance natural warm tones."
     assert completed[0]["selection_mode"] is None
     assert completed[0]["llm_score"] is None
     assert completed[0]["llm_reason"] is None
     assert completed[0]["generation_mode"] == "text_only"
     assert store.count_completed_rollouts_for_job(job_id) == 1
     assert store.list_completed_rollout_ids_for_job(job_id, limit=3) == [rollout_id]
+
+
+def test_create_candidate_comparison_rollout_metadata(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="candidate-pool",
+        description="candidate pool checks",
+        seed_system_prompt="seed",
+    )
+    rollout_id = store.create_rollout(
+        job_id=job_id,
+        prompt_text="prompt",
+        intent_text="intent",
+        baseline_image_uri="left.png",
+        candidate_image_uri="right.png",
+        candidate_id="candidate_right",
+        system_prompt="right policy",
+        rollout_type="candidate_comparison",
+        left_candidate_id="candidate_left",
+        right_candidate_id="candidate_right",
+        left_system_prompt_snapshot="left policy",
+        right_system_prompt_snapshot="right policy",
+        generation_mode="text_only",
+        model_config={"model": "image-model-a"},
+    )
+
+    rollout = store.list_rollouts_for_job(job_id)[0]
+    assert rollout["id"] == rollout_id
+    assert rollout["rollout_type"] == "candidate_comparison"
+    assert rollout["left_candidate_id"] == "candidate_left"
+    assert rollout["right_candidate_id"] == "candidate_right"
+    assert rollout["left_system_prompt_snapshot"] == "left policy"
+    assert rollout["right_system_prompt_snapshot"] == "right policy"
 
 
 def test_add_comparison_requires_non_empty_critique(tmp_path: Path) -> None:
@@ -463,10 +508,24 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert candidates[0]["parent_candidate_ids"] == []
     assert candidates[0]["objective_scores"]["preference_win"] == 0.8
     assert candidates[0]["frontier_member"] is False
+    assert candidates[0]["status"] == "proposed"
+    assert candidates[0]["evaluation_count"] == 0
+    assert candidates[0]["win_count"] == 0
+    assert candidates[0]["loss_count"] == 0
+    assert candidates[0]["tie_count"] == 0
+    assert candidates[0]["elo"] == 1000.0
+    assert candidates[0]["score"] == 0.5
+    assert candidates[0]["confidence"] == 0.0
+    assert candidates[0]["judge_metadata"] == {}
 
+    with pytest.raises(ValueError, match="before it is evaluated"):
+        store.promote_job_candidate(job_id, candidate_id)
+
+    store.update_gepa_candidate_status(candidate_id, "evaluated")
     store.set_candidate_frontier_membership(candidate_id, True)
     updated_candidates = store.list_gepa_candidates_for_job(job_id)
     assert updated_candidates[0]["frontier_member"] is True
+    assert updated_candidates[0]["status"] == "evaluated"
 
     store.promote_job_candidate(job_id, candidate_id)
     job = store.get_aesthetic_job(job_id)
@@ -475,6 +534,191 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
     assert job["compiled_system_prompt"] == "Use moody shadows and controlled highlights."
     assert job["baseline_system_prompt"] == "Increase contrast while preserving scene composition."
     assert job["latest_system_prompt"] == "Use moody shadows and controlled highlights."
+
+
+def test_candidate_feedback_stats_update_lifecycle_counts(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="candidate-stats",
+        description="stats checks",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA stats run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    winner_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="winner",
+        compiled_prompt="winner",
+        objective_scores={},
+        created_by_run_id=run_id,
+    )
+    loser_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="loser",
+        compiled_prompt="loser",
+        objective_scores={},
+        created_by_run_id=run_id,
+    )
+
+    store.update_candidate_feedback_stats(
+        winner_candidate_id=winner_id,
+        loser_candidate_id=loser_id,
+        winner_margin=0.5,
+        critique_confidence=0.8,
+        judge_metadata={"alignment_notes": "winner better follows the brief"},
+    )
+    candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
+    assert candidates[winner_id]["status"] == "evaluated"
+    assert candidates[winner_id]["evaluation_count"] == 1
+    assert candidates[winner_id]["win_count"] == 1
+    assert candidates[winner_id]["elo"] > 1000.0
+    assert candidates[winner_id]["score"] > candidates[loser_id]["score"]
+    assert candidates[winner_id]["confidence"] == pytest.approx(0.16)
+    assert candidates[winner_id]["objective_scores"]["candidate_win_rate"] == 1.0
+    assert candidates[winner_id]["objective_scores"]["evaluation_coverage"] == 0.2
+    assert candidates[loser_id]["status"] == "evaluated"
+    assert candidates[loser_id]["evaluation_count"] == 1
+    assert candidates[loser_id]["loss_count"] == 1
+    assert candidates[loser_id]["elo"] < 1000.0
+    assert candidates[loser_id]["objective_scores"]["candidate_win_rate"] == 0.0
+
+
+def test_archive_pending_gepa_candidates_for_job_only_archives_pending(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="archive-pending",
+        description="archive checks",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="Mutation run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    proposed_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="proposed",
+        compiled_prompt="proposed",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="proposed",
+    )
+    evaluating_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="evaluating",
+        compiled_prompt="evaluating",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="evaluating",
+    )
+    evaluated_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="evaluated",
+        compiled_prompt="evaluated",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="evaluated",
+    )
+
+    assert store.count_pending_gepa_candidates_for_job(job_id) == 2
+    assert store.archive_pending_gepa_candidates_for_job(job_id) == 2
+
+    candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
+    assert candidates[proposed_id]["status"] == "archived"
+    assert candidates[evaluating_id]["status"] == "archived"
+    assert candidates[evaluated_id]["status"] == "evaluated"
+    assert store.count_pending_gepa_candidates_for_job(job_id) == 0
+
+
+def test_best_training_candidate_allows_limited_evidence_for_sanity_check(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="best-check",
+        description="best candidate check",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="Mutation run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    candidate_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="candidate",
+        compiled_prompt="candidate",
+        objective_scores={},
+        created_by_run_id=run_id,
+        status="evaluated",
+    )
+    store.update_candidate_feedback_stats(
+        winner_candidate_id=candidate_id,
+        loser_candidate_id=None,
+        winner_margin=0.7,
+        critique_confidence=0.8,
+    )
+
+    selected = store.get_best_training_candidate(job_id)
+
+    assert selected is not None
+    assert selected["id"] == candidate_id
+    assert selected["evaluation_count"] == 1
+    assert selected["confidence"] < 0.5
+
+
+def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="frontier",
+        description="frontier checks",
+        seed_system_prompt="seed",
+    )
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA frontier run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    weak_candidate = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="weak",
+        compiled_prompt="weak",
+        objective_scores={"preference_win": 0.2, "feedback_quality": 0.2},
+        created_by_run_id=run_id,
+        status="evaluated",
+    )
+    strong_candidate = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="strong",
+        compiled_prompt="strong",
+        objective_scores={"preference_win": 0.8, "feedback_quality": 0.8},
+        created_by_run_id=run_id,
+        status="evaluated",
+    )
+
+    snapshot = store.recompute_gepa_frontier_for_job(job_id)
+    membership = {item["candidate_id"]: item["frontier_member"] for item in snapshot}
+    assert membership[weak_candidate] is False
+    assert membership[strong_candidate] is True
+
+    candidates = {item["id"]: item for item in store.list_gepa_candidates_for_job(job_id)}
+    assert candidates[weak_candidate]["frontier_member"] is False
+    assert candidates[strong_candidate]["frontier_member"] is True
+
+    promoted_id = store.promote_best_frontier_candidate(job_id)
+    assert promoted_id == strong_candidate
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    assert job["active_candidate_id"] == strong_candidate
 
 
 def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
@@ -555,10 +799,29 @@ def test_update_archive_gate_and_rollover_job_state(tmp_path: Path) -> None:
     )
     store.mark_rollout_feedback_complete(rollout_b, cmp_b)
     gate = store.get_gepa_gate_status(job_id)
-    assert gate["baseline_wins"] == 2
-    assert gate["candidate_wins"] == 0
+    assert gate["completed_feedback_count"] == 2
+    assert gate["new_feedback_count"] == 2
     assert gate["threshold"] == 3
     assert gate["enabled"] is False
+    assert gate["last_gepa_completed_at"] is None
+    assert set(store.list_gepa_eligible_rollout_ids_for_job(job_id, limit=3)) == {
+        rollout_a,
+        rollout_b,
+    }
+
+    gepa_run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA gate checkpoint",
+        config={"job_id": job_id, "minibatch_size": 2, "selected_rollout_ids": [rollout_a, rollout_b]},
+    )
+    store.update_run_status(gepa_run_id, "running")
+    store.update_run_status(gepa_run_id, "completed")
+    gate_after_run = store.get_gepa_gate_status(job_id)
+    assert gate_after_run["completed_feedback_count"] == 2
+    assert gate_after_run["new_feedback_count"] == 0
+    assert gate_after_run["enabled"] is False
+    assert gate_after_run["last_gepa_completed_at"] is not None
+    assert store.list_gepa_eligible_rollout_ids_for_job(job_id, limit=3) == []
 
     store.rollover_job_system_prompt(job_id, latest_system_prompt="optimized prompt")
     rolled = store.get_aesthetic_job(job_id)

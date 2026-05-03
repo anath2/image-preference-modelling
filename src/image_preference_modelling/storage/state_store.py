@@ -7,6 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from image_preference_modelling.gepa.reward import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_ELO,
+    DEFAULT_SCORE,
+    blended_candidate_score,
+    confidence_from_evidence,
+    pairwise_elo_update,
+)
 from image_preference_modelling.storage.contracts import (
     RatingOutcome,
     RunStatus,
@@ -20,15 +28,17 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
 VALID_RATING_SESSION_STATUSES = {"active", "archived"}
-VALID_RATING_OUTCOMES = {"winner", "both_good", "both_bad", "cant_decide"}
+VALID_RATING_OUTCOMES = {"winner", "no_clear_winner", "both_good", "both_bad", "cant_decide"}
 VALID_AESTHETIC_JOB_STATUSES = {"active", "archived"}
 VALID_ROLLOUT_STATUSES = {"generated", "feedback_complete"}
+VALID_ROLLOUT_TYPES = {"baseline_candidate", "candidate_comparison", "latest_prompt_check"}
 VALID_ROLLOUT_GENERATION_MODES = {"image_conditioned", "text_only"}
+VALID_GEPA_CANDIDATE_STATUSES = {"proposed", "evaluating", "evaluated", "archived"}
 DEFAULT_GEPA_ENABLE_THRESHOLD = 2
 
 
@@ -232,6 +242,10 @@ class StateStore:
                 compiled_prompt TEXT NOT NULL,
                 objective_scores_json TEXT NOT NULL,
                 frontier_member INTEGER NOT NULL DEFAULT 0,
+                elo REAL NOT NULL DEFAULT 1000.0,
+                score REAL NOT NULL DEFAULT 0.5,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                judge_metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_by_run_id TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(job_id) REFERENCES aesthetic_jobs(id),
@@ -270,6 +284,18 @@ class StateStore:
         if current_version == 6:
             self._migrate_v6_to_v7(connection)
             current_version = 7
+
+        if current_version == 7:
+            self._migrate_v7_to_v8(connection)
+            current_version = 8
+
+        if current_version == 8:
+            self._migrate_v8_to_v9(connection)
+            current_version = 9
+
+        if current_version == 9:
+            self._migrate_v9_to_v10(connection)
+            current_version = 10
 
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
@@ -459,6 +485,89 @@ class StateStore:
         if "llm_reason" not in rollout_columns:
             connection.execute("ALTER TABLE rollouts ADD COLUMN llm_reason TEXT")
         self._set_schema_version(connection, 7)
+
+    def _migrate_v7_to_v8(self, connection: sqlite3.Connection) -> None:
+        rollout_columns = {row[1] for row in connection.execute("PRAGMA table_info(rollouts)").fetchall()}
+        if "rollout_type" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN rollout_type TEXT NOT NULL DEFAULT 'baseline_candidate'"
+            )
+        if "left_candidate_id" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN left_candidate_id TEXT")
+        if "right_candidate_id" not in rollout_columns:
+            connection.execute("ALTER TABLE rollouts ADD COLUMN right_candidate_id TEXT")
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET right_candidate_id = candidate_id
+                WHERE right_candidate_id IS NULL AND candidate_id IS NOT NULL
+                """
+            )
+        if "left_system_prompt_snapshot" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN left_system_prompt_snapshot TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET left_system_prompt_snapshot = baseline_system_prompt_snapshot
+                WHERE left_system_prompt_snapshot = ''
+                """
+            )
+        if "right_system_prompt_snapshot" not in rollout_columns:
+            connection.execute(
+                "ALTER TABLE rollouts ADD COLUMN right_system_prompt_snapshot TEXT NOT NULL DEFAULT ''"
+            )
+            connection.execute(
+                """
+                UPDATE rollouts
+                SET right_system_prompt_snapshot = system_prompt
+                WHERE right_system_prompt_snapshot = ''
+                """
+            )
+        self._set_schema_version(connection, 8)
+
+    def _migrate_v8_to_v9(self, connection: sqlite3.Connection) -> None:
+        candidate_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(gepa_candidates)").fetchall()
+        }
+        if "status" not in candidate_columns:
+            connection.execute(
+                "ALTER TABLE gepa_candidates ADD COLUMN status TEXT NOT NULL DEFAULT 'evaluated'"
+            )
+        if "evaluation_count" not in candidate_columns:
+            connection.execute(
+                "ALTER TABLE gepa_candidates ADD COLUMN evaluation_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "win_count" not in candidate_columns:
+            connection.execute("ALTER TABLE gepa_candidates ADD COLUMN win_count INTEGER NOT NULL DEFAULT 0")
+        if "loss_count" not in candidate_columns:
+            connection.execute("ALTER TABLE gepa_candidates ADD COLUMN loss_count INTEGER NOT NULL DEFAULT 0")
+        if "tie_count" not in candidate_columns:
+            connection.execute("ALTER TABLE gepa_candidates ADD COLUMN tie_count INTEGER NOT NULL DEFAULT 0")
+        self._set_schema_version(connection, 9)
+
+    def _migrate_v9_to_v10(self, connection: sqlite3.Connection) -> None:
+        candidate_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(gepa_candidates)").fetchall()
+        }
+        if "elo" not in candidate_columns:
+            connection.execute(
+                f"ALTER TABLE gepa_candidates ADD COLUMN elo REAL NOT NULL DEFAULT {DEFAULT_ELO}"
+            )
+        if "score" not in candidate_columns:
+            connection.execute(
+                f"ALTER TABLE gepa_candidates ADD COLUMN score REAL NOT NULL DEFAULT {DEFAULT_SCORE}"
+            )
+        if "confidence" not in candidate_columns:
+            connection.execute(
+                f"ALTER TABLE gepa_candidates ADD COLUMN confidence REAL NOT NULL DEFAULT {DEFAULT_CONFIDENCE}"
+            )
+        if "judge_metadata_json" not in candidate_columns:
+            connection.execute(
+                "ALTER TABLE gepa_candidates ADD COLUMN judge_metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        self._set_schema_version(connection, 10)
 
     def create_run(self, run_type: RunType, display_name: str, config: dict[str, Any]) -> str:
         if run_type not in VALID_RUN_TYPES:
@@ -904,6 +1013,11 @@ class StateStore:
         system_prompt: str,
         baseline_system_prompt_snapshot: str = "",
         latest_system_prompt_snapshot: str = "",
+        rollout_type: str = "baseline_candidate",
+        left_candidate_id: str | None = None,
+        right_candidate_id: str | None = None,
+        left_system_prompt_snapshot: str | None = None,
+        right_system_prompt_snapshot: str | None = None,
         prompt_category: str | None = None,
         selection_mode: str | None = None,
         llm_score: float | None = None,
@@ -911,6 +1025,8 @@ class StateStore:
         generation_mode: str,
         model_config: dict[str, Any],
     ) -> str:
+        if rollout_type not in VALID_ROLLOUT_TYPES:
+            raise ValueError(f"Unsupported rollout_type: {rollout_type}")
         if generation_mode not in VALID_ROLLOUT_GENERATION_MODES:
             raise ValueError(f"Unsupported rollout generation_mode: {generation_mode}")
         if self.get_aesthetic_job(job_id) is None:
@@ -931,6 +1047,17 @@ class StateStore:
                 "system_prompt": system_prompt,
                 "baseline_system_prompt_snapshot": baseline_system_prompt_snapshot,
                 "latest_system_prompt_snapshot": latest_system_prompt_snapshot,
+                "rollout_type": rollout_type,
+                "left_candidate_id": left_candidate_id,
+                "right_candidate_id": right_candidate_id if right_candidate_id is not None else candidate_id,
+                "left_system_prompt_snapshot": (
+                    left_system_prompt_snapshot
+                    if left_system_prompt_snapshot is not None
+                    else baseline_system_prompt_snapshot
+                ),
+                "right_system_prompt_snapshot": (
+                    right_system_prompt_snapshot if right_system_prompt_snapshot is not None else system_prompt
+                ),
                 "prompt_category": prompt_category,
                 "selection_mode": selection_mode,
                 "llm_score": llm_score,
@@ -965,7 +1092,10 @@ class StateStore:
         compiled_prompt: str,
         objective_scores: dict[str, float],
         created_by_run_id: str | None,
+        status: str = "proposed",
     ) -> str:
+        if status not in VALID_GEPA_CANDIDATE_STATUSES:
+            raise ValueError(f"Unsupported GEPA candidate status: {status}")
         if self.get_aesthetic_job(job_id) is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
         if created_by_run_id is not None and self.get_run(created_by_run_id) is None:
@@ -978,8 +1108,10 @@ class StateStore:
                 INSERT INTO gepa_candidates(
                     id, job_id, parent_candidate_ids_json, candidate_text,
                     compiled_prompt, objective_scores_json, frontier_member,
+                    elo, score, confidence, judge_metadata_json,
+                    status, evaluation_count, win_count, loss_count, tie_count,
                     created_by_run_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     candidate_id,
@@ -989,6 +1121,15 @@ class StateStore:
                     compiled_prompt,
                     json.dumps(objective_scores),
                     0,
+                    DEFAULT_ELO,
+                    DEFAULT_SCORE,
+                    DEFAULT_CONFIDENCE,
+                    json.dumps({}),
+                    status,
+                    0,
+                    0,
+                    0,
+                    0,
                     created_by_run_id,
                     _utc_now(),
                 ),
@@ -996,17 +1137,31 @@ class StateStore:
             connection.commit()
         return candidate_id
 
-    def list_gepa_candidates_for_job(self, job_id: str) -> list[dict[str, Any]]:
+    def list_gepa_candidates_for_job(
+        self, job_id: str, statuses: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        if statuses is not None:
+            invalid_statuses = [status for status in statuses if status not in VALID_GEPA_CANDIDATE_STATUSES]
+            if invalid_statuses:
+                raise ValueError(f"Unsupported GEPA candidate status: {invalid_statuses[0]}")
         with self._connect() as connection:
+            where_clause = "WHERE job_id = ?"
+            params: tuple[Any, ...] = (job_id,)
+            if statuses:
+                placeholders = ", ".join("?" for _ in statuses)
+                where_clause += f" AND status IN ({placeholders})"
+                params = (job_id, *statuses)
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, job_id, parent_candidate_ids_json, candidate_text, compiled_prompt,
-                       objective_scores_json, frontier_member, created_by_run_id, created_at
+                       objective_scores_json, frontier_member, status, evaluation_count,
+                       win_count, loss_count, tie_count, elo, score, confidence,
+                       judge_metadata_json, created_by_run_id, created_at
                 FROM gepa_candidates
-                WHERE job_id = ?
+                {where_clause}
                 ORDER BY created_at DESC
                 """,
-                (job_id,),
+                params,
             ).fetchall()
 
         results: list[dict[str, Any]] = []
@@ -1014,6 +1169,7 @@ class StateStore:
             item = dict(row)
             item["parent_candidate_ids"] = json.loads(item.pop("parent_candidate_ids_json"))
             item["objective_scores"] = json.loads(item.pop("objective_scores_json"))
+            item["judge_metadata"] = json.loads(item.pop("judge_metadata_json") or "{}")
             item["frontier_member"] = bool(item["frontier_member"])
             results.append(item)
         return results
@@ -1032,6 +1188,227 @@ class StateStore:
             )
             connection.commit()
 
+    def update_gepa_candidate_status(self, candidate_id: str, status: str) -> None:
+        if status not in VALID_GEPA_CANDIDATE_STATUSES:
+            raise ValueError(f"Unsupported GEPA candidate status: {status}")
+        with self._connect() as connection:
+            candidate = connection.execute(
+                "SELECT id FROM gepa_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"GEPA candidate {candidate_id} does not exist")
+            connection.execute(
+                "UPDATE gepa_candidates SET status = ? WHERE id = ?",
+                (status, candidate_id),
+            )
+            connection.commit()
+
+    def update_candidate_feedback_stats(
+        self,
+        *,
+        winner_candidate_id: str | None,
+        loser_candidate_id: str | None,
+        tied_candidate_ids: list[str] | None = None,
+        winner_margin: float = 1.0,
+        critique_confidence: float = 1.0,
+        judge_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        tied_ids = [candidate_id for candidate_id in (tied_candidate_ids or []) if candidate_id]
+        with self._connect() as connection:
+            candidate_ids = [candidate_id for candidate_id in [winner_candidate_id, loser_candidate_id, *tied_ids] if candidate_id]
+            if candidate_ids:
+                placeholders = ", ".join("?" for _ in candidate_ids)
+                existing = {
+                    str(row["id"])
+                    for row in connection.execute(
+                        f"SELECT id FROM gepa_candidates WHERE id IN ({placeholders})",
+                        tuple(candidate_ids),
+                    ).fetchall()
+                }
+                missing = [candidate_id for candidate_id in candidate_ids if candidate_id not in existing]
+                if missing:
+                    raise ValueError(f"GEPA candidate {missing[0]} does not exist")
+            if winner_candidate_id and loser_candidate_id:
+                rows = {
+                    str(row["id"]): row
+                    for row in connection.execute(
+                        "SELECT id, elo FROM gepa_candidates WHERE id IN (?, ?)",
+                        (winner_candidate_id, loser_candidate_id),
+                    ).fetchall()
+                }
+                elo_update = pairwise_elo_update(
+                    left_elo=float(rows[winner_candidate_id]["elo"]),
+                    right_elo=float(rows[loser_candidate_id]["elo"]),
+                    winner="left",
+                    winner_margin=winner_margin,
+                )
+                connection.execute(
+                    "UPDATE gepa_candidates SET elo = ? WHERE id = ?",
+                    (elo_update.left_elo, winner_candidate_id),
+                )
+                connection.execute(
+                    "UPDATE gepa_candidates SET elo = ? WHERE id = ?",
+                    (elo_update.right_elo, loser_candidate_id),
+                )
+            if winner_candidate_id:
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET evaluation_count = evaluation_count + 1,
+                        win_count = win_count + 1,
+                        status = 'evaluated'
+                    WHERE id = ?
+                    """,
+                    (winner_candidate_id,),
+                )
+            if loser_candidate_id:
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET evaluation_count = evaluation_count + 1,
+                        loss_count = loss_count + 1,
+                        status = 'evaluated'
+                    WHERE id = ?
+                    """,
+                    (loser_candidate_id,),
+                )
+            for candidate_id in tied_ids:
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET evaluation_count = evaluation_count + 1,
+                        tie_count = tie_count + 1,
+                        status = 'evaluated'
+                    WHERE id = ?
+                    """,
+                    (candidate_id,),
+                )
+            affected_ids = sorted(set(candidate_ids))
+            for candidate_id in affected_ids:
+                row = connection.execute(
+                    """
+                    SELECT evaluation_count, win_count, tie_count, elo, judge_metadata_json
+                    FROM gepa_candidates
+                    WHERE id = ?
+                    """,
+                    (candidate_id,),
+                ).fetchone()
+                if row is None:
+                    continue
+                evaluation_count = int(row["evaluation_count"] or 0)
+                win_count = int(row["win_count"] or 0)
+                tie_count = int(row["tie_count"] or 0)
+                elo = float(row["elo"] or DEFAULT_ELO)
+                judge_summary = self._updated_judge_summary(
+                    json.loads(row["judge_metadata_json"] or "{}"),
+                    winner_margin=winner_margin if candidate_id in {winner_candidate_id, loser_candidate_id} else 0.0,
+                    critique_confidence=critique_confidence,
+                    judge_metadata=judge_metadata,
+                )
+                judge_count = int(judge_summary.get("judge_count") or 0)
+                avg_confidence = (
+                    float(judge_summary.get("critique_confidence_total") or 0.0) / float(judge_count)
+                    if judge_count
+                    else 0.0
+                )
+                avg_margin = (
+                    float(judge_summary.get("winner_margin_total") or 0.0) / float(judge_count)
+                    if judge_count
+                    else 0.0
+                )
+                confidence = confidence_from_evidence(
+                    evaluation_count=evaluation_count,
+                    average_critique_confidence=avg_confidence,
+                )
+                blended_score = blended_candidate_score(
+                    elo=elo,
+                    confidence=confidence,
+                    average_margin_quality=avg_margin,
+                )
+                win_rate = (
+                    (float(win_count) + 0.5 * float(tie_count)) / float(evaluation_count)
+                    if evaluation_count
+                    else 0.0
+                )
+                scores = {
+                    "candidate_win_rate": win_rate,
+                    "evaluation_coverage": min(1.0, float(evaluation_count) / 5.0),
+                    "human_preference": win_rate,
+                    "evaluation_confidence": confidence,
+                    "critique_margin": avg_margin,
+                    "blended_score": blended_score,
+                }
+                connection.execute(
+                    """
+                    UPDATE gepa_candidates
+                    SET objective_scores_json = ?, score = ?, confidence = ?, judge_metadata_json = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(scores), blended_score, confidence, json.dumps(judge_summary), candidate_id),
+                )
+            connection.commit()
+
+    def _updated_judge_summary(
+        self,
+        existing: dict[str, Any],
+        *,
+        winner_margin: float,
+        critique_confidence: float,
+        judge_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        summary = dict(existing)
+        summary["judge_count"] = int(summary.get("judge_count") or 0) + 1
+        summary["winner_margin_total"] = float(summary.get("winner_margin_total") or 0.0) + max(
+            0.0, min(1.0, float(winner_margin))
+        )
+        summary["critique_confidence_total"] = float(
+            summary.get("critique_confidence_total") or 0.0
+        ) + max(0.0, min(1.0, float(critique_confidence)))
+        if judge_metadata:
+            recent = list(summary.get("recent_judgements") or [])
+            recent.append(judge_metadata)
+            summary["recent_judgements"] = recent[-5:]
+        return summary
+
+    def recompute_gepa_frontier_for_job(self, job_id: str) -> list[dict[str, Any]]:
+        candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+
+        def dominates(a: dict[str, float], b: dict[str, float]) -> bool:
+            keys = set(a) | set(b)
+            return (
+                all(float(a.get(key, 0.0)) >= float(b.get(key, 0.0)) for key in keys)
+                and any(float(a.get(key, 0.0)) > float(b.get(key, 0.0)) for key in keys)
+            )
+
+        frontier_ids: set[str] = set()
+        for candidate in candidates:
+            candidate_scores = candidate["objective_scores"]
+            is_dominated = any(
+                other["id"] != candidate["id"]
+                and dominates(other["objective_scores"], candidate_scores)
+                for other in candidates
+            )
+            if not is_dominated:
+                frontier_ids.add(str(candidate["id"]))
+
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE gepa_candidates SET frontier_member = 0 WHERE job_id = ?",
+                (job_id,),
+            )
+            for candidate in candidates:
+                connection.execute(
+                    "UPDATE gepa_candidates SET frontier_member = ? WHERE id = ?",
+                    (1 if candidate["id"] in frontier_ids else 0, candidate["id"]),
+                )
+            connection.commit()
+
+        return [
+            {"candidate_id": candidate["id"], "frontier_member": candidate["id"] in frontier_ids}
+            for candidate in candidates
+        ]
+
     def promote_job_candidate(self, job_id: str, candidate_id: str) -> None:
         with self._connect() as connection:
             job = connection.execute(
@@ -1041,13 +1418,17 @@ class StateStore:
             if job is None:
                 raise ValueError(f"Aesthetic job {job_id} does not exist")
             candidate = connection.execute(
-                "SELECT id, job_id, compiled_prompt FROM gepa_candidates WHERE id = ?",
+                "SELECT id, job_id, compiled_prompt, status, frontier_member FROM gepa_candidates WHERE id = ?",
                 (candidate_id,),
             ).fetchone()
             if candidate is None:
                 raise ValueError(f"GEPA candidate {candidate_id} does not exist")
             if candidate["job_id"] != job_id:
                 raise ValueError("Cannot promote candidate for a different aesthetic job")
+            if candidate["status"] != "evaluated":
+                raise ValueError("Cannot promote a GEPA candidate before it is evaluated")
+            if not bool(candidate["frontier_member"]):
+                raise ValueError("Cannot promote a GEPA candidate that is not on the frontier")
             job_row = connection.execute(
                 "SELECT latest_system_prompt FROM aesthetic_jobs WHERE id = ?",
                 (job_id,),
@@ -1071,33 +1452,158 @@ class StateStore:
             )
             connection.commit()
 
+    def promote_best_frontier_candidate(self, job_id: str) -> str:
+        self.recompute_gepa_frontier_for_job(job_id)
+        candidates = [
+            candidate
+            for candidate in self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+            if candidate["frontier_member"]
+        ]
+        if not candidates:
+            raise ValueError(f"Aesthetic job {job_id} has no evaluated frontier candidates")
+
+        def ranking_key(candidate: dict[str, Any]) -> tuple[float, int, str]:
+            scores = candidate["objective_scores"]
+            return (
+                float(candidate.get("score") or scores.get("blended_score", 0.0)),
+                int(candidate.get("evaluation_count") or 0),
+                str(candidate["created_at"]),
+            )
+
+        selected = max(candidates, key=ranking_key)
+        self.promote_job_candidate(job_id, str(selected["id"]))
+        return str(selected["id"])
+
+    def get_best_training_candidate(
+        self,
+        job_id: str,
+        *,
+        min_evaluations: int = 1,
+        min_confidence: float = 0.0,
+    ) -> dict[str, Any] | None:
+        candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+        eligible = [
+            candidate
+            for candidate in candidates
+            if int(candidate.get("evaluation_count") or 0) >= min_evaluations
+            and float(candidate.get("confidence") or 0.0) >= min_confidence
+        ]
+        if not eligible:
+            return None
+
+        def ranking_key(candidate: dict[str, Any]) -> tuple[float, float, float, str]:
+            return (
+                float(candidate.get("score") or 0.0),
+                float(candidate.get("elo") or DEFAULT_ELO),
+                float(candidate.get("confidence") or 0.0),
+                str(candidate["created_at"]),
+            )
+
+        return max(eligible, key=ranking_key)
+
+    def count_pending_gepa_candidates_for_job(self, job_id: str) -> int:
+        with self._connect() as connection:
+            count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM gepa_candidates
+                WHERE job_id = ? AND status IN ('proposed', 'evaluating')
+                """,
+                (job_id,),
+            ).fetchone()[0]
+        return int(count or 0)
+
+    def archive_pending_gepa_candidates_for_job(self, job_id: str) -> int:
+        if self.get_aesthetic_job(job_id) is None:
+            raise ValueError(f"Aesthetic job {job_id} does not exist")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE gepa_candidates
+                SET status = 'archived'
+                WHERE job_id = ? AND status IN ('proposed', 'evaluating')
+                """,
+                (job_id,),
+            )
+            connection.commit()
+        return int(cursor.rowcount or 0)
+
+    def count_active_gepa_runs_for_job(self, job_id: str) -> int:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT config_json
+                FROM runs
+                WHERE run_type = 'gepa' AND status IN ('queued', 'running')
+                """
+            ).fetchall()
+        count = 0
+        for row in rows:
+            try:
+                config = json.loads(row["config_json"])
+            except json.JSONDecodeError:
+                continue
+            if str(config.get("job_id") or "").strip() == job_id:
+                count += 1
+        return count
+
+    def _latest_completed_gepa_finished_at_for_job(
+        self, connection: sqlite3.Connection, job_id: str
+    ) -> str | None:
+        rows = connection.execute(
+            """
+            SELECT config_json, finished_at
+            FROM runs
+            WHERE run_type = 'gepa'
+                AND status = 'completed'
+                AND finished_at IS NOT NULL
+            ORDER BY finished_at DESC
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                config = json.loads(row["config_json"])
+            except json.JSONDecodeError:
+                continue
+            if str(config.get("job_id") or "").strip() == job_id:
+                return str(row["finished_at"])
+        return None
+
     def get_gepa_gate_status(self, job_id: str) -> dict[str, Any]:
         job = self.get_aesthetic_job(job_id)
         if job is None:
             raise ValueError(f"Aesthetic job {job_id} does not exist")
         threshold = max(1, int(job.get("gepa_enable_threshold") or DEFAULT_GEPA_ENABLE_THRESHOLD))
         with self._connect() as connection:
-            row = connection.execute(
+            total_completed = connection.execute(
                 """
-                SELECT
-                    SUM(CASE WHEN c.outcome = 'winner' AND c.winner = 'left' THEN 1 ELSE 0 END) AS baseline_wins,
-                    SUM(CASE WHEN c.outcome = 'winner' AND c.winner = 'right' THEN 1 ELSE 0 END) AS candidate_wins
-                FROM rollouts r
-                JOIN comparisons c ON c.id = r.comparison_id
-                WHERE r.job_id = ? AND r.status = 'feedback_complete'
+                SELECT COUNT(*)
+                FROM rollouts
+                WHERE job_id = ? AND status = 'feedback_complete'
                 """,
                 (job_id,),
-            ).fetchone()
-        baseline_wins = int(row["baseline_wins"] or 0) if row else 0
-        candidate_wins = int(row["candidate_wins"] or 0) if row else 0
-        lead = baseline_wins - candidate_wins
-        enabled = baseline_wins > candidate_wins and lead >= threshold
+            ).fetchone()[0]
+            last_completed_at = self._latest_completed_gepa_finished_at_for_job(connection, job_id)
+            if last_completed_at is None:
+                new_feedback = total_completed
+            else:
+                new_feedback = connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM rollouts
+                    WHERE job_id = ?
+                        AND status = 'feedback_complete'
+                        AND feedback_completed_at > ?
+                    """,
+                    (job_id, last_completed_at),
+                ).fetchone()[0]
+        new_feedback_count = int(new_feedback or 0)
         return {
-            "baseline_wins": baseline_wins,
-            "candidate_wins": candidate_wins,
+            "completed_feedback_count": int(total_completed or 0),
+            "new_feedback_count": new_feedback_count,
             "threshold": threshold,
-            "enabled": enabled,
-            "lead": lead,
+            "enabled": new_feedback_count >= threshold,
+            "last_gepa_completed_at": last_completed_at,
         }
 
     def mark_rollout_feedback_complete(self, rollout_id: str, comparison_id: str) -> None:
@@ -1167,6 +1673,36 @@ class StateStore:
             ).fetchall()
         return [str(row["id"]) for row in rows]
 
+    def list_gepa_eligible_rollout_ids_for_job(self, job_id: str, limit: int) -> list[str]:
+        bounded_limit = max(1, int(limit))
+        with self._connect() as connection:
+            last_completed_at = self._latest_completed_gepa_finished_at_for_job(connection, job_id)
+            if last_completed_at is None:
+                rows = connection.execute(
+                    """
+                    SELECT id
+                    FROM rollouts
+                    WHERE job_id = ? AND status = 'feedback_complete'
+                    ORDER BY feedback_completed_at DESC
+                    LIMIT ?
+                    """,
+                    (job_id, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT id
+                    FROM rollouts
+                    WHERE job_id = ?
+                        AND status = 'feedback_complete'
+                        AND feedback_completed_at > ?
+                    ORDER BY feedback_completed_at DESC
+                    LIMIT ?
+                    """,
+                    (job_id, last_completed_at, bounded_limit),
+                ).fetchall()
+        return [str(row["id"]) for row in rows]
+
     def get_completed_rollouts_with_feedback(
         self, job_id: str, rollout_ids: list[str]
     ) -> list[dict[str, Any]]:
@@ -1185,6 +1721,11 @@ class StateStore:
                 r.candidate_image_uri,
                 r.candidate_id,
                 r.system_prompt,
+                r.rollout_type,
+                r.left_candidate_id,
+                r.right_candidate_id,
+                r.left_system_prompt_snapshot,
+                r.right_system_prompt_snapshot,
                 r.generation_mode,
                 r.model_config_json,
                 r.status,
@@ -1338,7 +1879,7 @@ class StateStore:
                     )
             rollouts = connection.execute(
                 """
-                SELECT r.id, r.job_id, r.status, r.generation_mode, j.id AS job_exists
+                SELECT r.id, r.job_id, r.status, r.rollout_type, r.generation_mode, j.id AS job_exists
                 FROM rollouts r
                 LEFT JOIN aesthetic_jobs j ON j.id = r.job_id
                 """
@@ -1352,6 +1893,11 @@ class StateStore:
                 if rollout["status"] not in VALID_ROLLOUT_STATUSES:
                     issues["invalid_rollouts"].append(
                         f"{rollout_id}: invalid rollout status `{rollout['status']}`"
+                    )
+                rollout_type = rollout["rollout_type"] if "rollout_type" in rollout.keys() else None
+                if rollout_type is not None and rollout_type not in VALID_ROLLOUT_TYPES:
+                    issues["invalid_rollouts"].append(
+                        f"{rollout_id}: invalid rollout_type `{rollout_type}`"
                     )
                 mode = rollout["generation_mode"] if "generation_mode" in rollout.keys() else None
                 if mode is not None and mode not in VALID_ROLLOUT_GENERATION_MODES:

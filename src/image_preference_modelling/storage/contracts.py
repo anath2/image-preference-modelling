@@ -6,7 +6,7 @@ from typing import Literal
 
 RunType = Literal["generation", "reward_model", "gepa", "evaluation"]
 RunStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
-RatingOutcome = Literal["winner", "both_good", "both_bad", "cant_decide"]
+RatingOutcome = Literal["winner", "no_clear_winner", "both_good", "both_bad", "cant_decide"]
 AestheticJobStatus = Literal["active", "archived"]
 RolloutStatus = Literal["generated", "feedback_complete"]
 

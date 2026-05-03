@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from image_preference_modelling.gepa.mutation_engine import generate_prompt_mutation
 from image_preference_modelling.gepa.scoring import score_rollout_feedback
 from image_preference_modelling.storage.state_store import StateStore
 
@@ -14,101 +15,30 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_compiled_prompt(
-    current_prompt: str | None,
-    critiques: list[str],
-) -> str:
-    base_prompt = (current_prompt or "").strip() or "Refine the image while preserving original intent."
-    base = base_prompt.split("\n\nFeedback reflections:")[0].strip()
-    condensed = "; ".join(c.strip() for c in critiques if c.strip())
-    if not condensed:
-        return base
-    return f"{base}\n\nFeedback reflections: {condensed}"
-
-
-def _optimize_with_dspy_gepa(
+def _select_parent_candidate(
     *,
-    base_prompt: str,
-    critiques: list[str],
-    minibatch_size: int,
+    job: dict[str, Any],
+    candidates: list[dict[str, Any]],
     config: dict[str, Any],
-) -> str:
-    import dspy
+) -> tuple[str | None, str]:
+    requested_parent_id = str(config.get("parent_candidate_id") or "").strip()
+    if requested_parent_id:
+        requested = next((candidate for candidate in candidates if candidate["id"] == requested_parent_id), None)
+        if requested is not None:
+            return requested["id"], str(requested["compiled_prompt"])
 
-    model_name = (
-        str(config.get("dspy_model") or "").strip()
-        or os.getenv("DSPY_MODEL", "").strip()
-        or os.getenv("PROMPT_MODEL", "").strip()
-    )
-    api_key = str(config.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY", "")).strip()
-    api_base = (
-        str(config.get("openrouter_base_url") or os.getenv("OPENROUTER_BASE_URL", "")).strip()
-        or "https://openrouter.ai/api/v1"
-    )
-    if not model_name or not api_key:
-        raise RuntimeError("Missing DSPy/OpenRouter configuration for GEPA optimization")
+    evaluated_candidates = [candidate for candidate in candidates if candidate.get("status") == "evaluated"]
+    frontier = [candidate for candidate in evaluated_candidates if candidate["frontier_member"]]
+    pool = frontier or evaluated_candidates
+    if pool:
+        seed = config.get("candidate_selection_seed")
+        rng = random.Random(seed) if seed is not None else random.Random()
+        selected = rng.choice(pool)
+        return selected["id"], str(selected["compiled_prompt"])
 
-    lm = dspy.LM(
-        model=model_name,
-        api_key=api_key,
-        api_base=api_base.rstrip("/"),
-        temperature=0,
-        max_tokens=2048,
-    )
-    dspy.configure(lm=lm)
-
-    class PolicyRewrite(dspy.Signature):
-        """Improve a system prompt policy based on user feedback."""
-
-        current_policy = dspy.InputField()
-        feedback = dspy.InputField()
-        improved_policy = dspy.OutputField()
-
-    class PolicyStudent(dspy.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.proposer = dspy.Predict(PolicyRewrite)
-
-        def forward(self, current_policy: str, feedback: str):  # type: ignore[override]
-            return self.proposer(current_policy=current_policy, feedback=feedback)
-
-    trainset = [
-        dspy.Example(
-            current_policy=base_prompt,
-            feedback=critique.strip(),
-            improved_policy=base_prompt,
-        ).with_inputs("current_policy", "feedback")
-        for critique in critiques
-        if critique.strip()
-    ]
-    if not trainset:
-        raise RuntimeError("No critique feedback available for DSPy GEPA optimization")
-
-    def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):  # noqa: ANN001, ARG001
-        improved = str(getattr(pred, "improved_policy", "")).strip()
-        return 1.0 if improved else 0.0
-
-    teleprompter = dspy.GEPA(
-        metric=metric,
-        auto="light",
-        reflection_minibatch_size=max(1, minibatch_size),
-        candidate_selection_strategy="pareto",
-        reflection_lm=lm,
-    )
-    optimized = teleprompter.compile(
-        PolicyStudent(),
-        trainset=trainset,
-        valset=trainset,
-    )
-    prediction = optimized(
-        current_policy=base_prompt,
-        feedback="; ".join(c.strip() for c in critiques if c.strip()),
-    )
-    improved_prompt = str(getattr(prediction, "improved_policy", "")).strip()
-    if not improved_prompt:
-        raise RuntimeError("DSPy GEPA did not produce an improved policy")
-    return improved_prompt
-
+    parent_candidate_id = config.get("active_candidate_id") or job.get("active_candidate_id")
+    base_prompt = (job.get("latest_system_prompt") or job.get("compiled_system_prompt") or "").strip()
+    return str(parent_candidate_id) if parent_candidate_id else None, base_prompt
 
 def run_gepa_optimization(
     *,
@@ -160,25 +90,32 @@ def run_gepa_optimization(
 
     n = float(len(rollouts))
     objective_means = {key: value / n for key, value in objective_totals.items()}
-    base_prompt = (job.get("latest_system_prompt") or job.get("compiled_system_prompt") or "").strip()
-    optimizer_backend = str(config.get("optimizer_backend", "dspy_gepa")).strip() or "dspy_gepa"
-    if optimizer_backend == "dspy_gepa":
-        try:
-            compiled_prompt = _optimize_with_dspy_gepa(
-                base_prompt=base_prompt or "Refine the image while preserving original intent.",
-                critiques=critiques,
-                minibatch_size=minibatch_size,
-                config=config,
-            )
-            append_event("INFO", "DSPy GEPA optimization completed.")
-        except Exception as exc:  # noqa: BLE001
-            append_event("WARN", f"DSPy GEPA unavailable; falling back to heuristic policy update ({exc}).")
-            compiled_prompt = _build_compiled_prompt(job.get("latest_system_prompt"), critiques)
-            optimizer_backend = "heuristic_fallback"
-    else:
-        compiled_prompt = _build_compiled_prompt(job.get("latest_system_prompt"), critiques)
+    existing_candidates = state_store.list_gepa_candidates_for_job(job_id)
+    parent_candidate_id, base_prompt = _select_parent_candidate(
+        job=job,
+        candidates=existing_candidates,
+        config=config,
+    )
+    requested_backend = str(config.get("optimizer_backend") or "").strip()
+    mutation = generate_prompt_mutation(
+        parent_prompt=base_prompt or "Refine the image while preserving original intent.",
+        job_description=str(job.get("description") or ""),
+        critiques=critiques,
+        lineage_summary={
+            "parent_candidate_id": parent_candidate_id,
+            "objective_means": objective_means,
+            "existing_candidate_count": len(existing_candidates),
+        },
+        allow_env_settings=not (
+            requested_backend in {"heuristic", "heuristic_fallback"}
+            or config.get("openrouter_api_key") == ""
+            or config.get("prompt_model") == ""
+        ),
+    )
+    compiled_prompt = mutation.compiled_prompt
+    optimizer_backend = mutation.backend
+    append_event("INFO", f"Prompt mutation generated with backend `{optimizer_backend}`.")
 
-    parent_candidate_id = config.get("active_candidate_id") or job.get("active_candidate_id")
     parent_candidate_ids = [parent_candidate_id] if parent_candidate_id else []
     candidate_id = state_store.create_gepa_candidate(
         job_id=job_id,
@@ -188,8 +125,8 @@ def run_gepa_optimization(
         objective_scores=objective_means,
         created_by_run_id=run_id,
     )
-    state_store.set_candidate_frontier_membership(candidate_id, True)
-    state_store.promote_job_candidate(job_id, candidate_id)
+    frontier_snapshot = state_store.recompute_gepa_frontier_for_job(job_id)
+    append_event("INFO", f"GEPA candidate {candidate_id} created as proposed; promotion requires evaluation.")
 
     checkpoint = {
         "run_id": run_id,
@@ -198,10 +135,13 @@ def run_gepa_optimization(
         "selected_rollout_ids": [str(r["id"]) for r in rollouts],
         "parent_candidate_id": parent_candidate_id,
         "new_candidate_id": candidate_id,
+        "new_candidate_status": "proposed",
+        "promoted_candidate": False,
         "compiled_prompt": compiled_prompt,
         "optimizer_backend": optimizer_backend,
+        "mutation_metadata": mutation.metadata,
         "objective_scores": objective_means,
-        "frontier_snapshot": [{"candidate_id": candidate_id, "frontier_member": True}],
+        "frontier_snapshot": frontier_snapshot,
         "created_at": _utc_now(),
         "rollout_scores": rollout_scores,
     }

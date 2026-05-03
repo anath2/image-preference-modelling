@@ -41,7 +41,7 @@ def _create_completed_rollout(
     return rollout_id
 
 
-def test_run_gepa_optimization_writes_checkpoint_and_promotes_candidate(tmp_path: Path) -> None:
+def test_run_gepa_optimization_writes_checkpoint_and_proposes_candidate(tmp_path: Path) -> None:
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(
         name="cinematic",
@@ -95,21 +95,27 @@ def test_run_gepa_optimization_writes_checkpoint_and_promotes_candidate(tmp_path
     assert checkpoint["minibatch_size"] == 2
     assert set(checkpoint["selected_rollout_ids"]) == {rollout_a, rollout_b}
     assert "new_candidate_id" in checkpoint
-    assert checkpoint["optimizer_backend"] in {"dspy_gepa", "heuristic_fallback"}
+    assert checkpoint["new_candidate_status"] == "proposed"
+    assert checkpoint["promoted_candidate"] is False
+    assert checkpoint["optimizer_backend"] in {"llm_mutation", "heuristic_fallback"}
+    assert "mutation_metadata" in checkpoint
 
     job = store.get_aesthetic_job(job_id)
     assert job is not None
-    assert job["active_candidate_id"] == checkpoint["new_candidate_id"]
-    assert job["compiled_system_prompt"] == checkpoint["compiled_prompt"]
-    assert job["baseline_system_prompt"] == "Improve cinematic depth while preserving layout."
-    assert job["latest_system_prompt"] == checkpoint["compiled_prompt"]
+    assert job["active_candidate_id"] is None
+    assert job["compiled_system_prompt"] == "Improve cinematic depth while preserving layout."
+    assert job["baseline_system_prompt"] == ""
+    assert job["latest_system_prompt"] == "Improve cinematic depth while preserving layout."
+    candidates = store.list_gepa_candidates_for_job(job_id)
+    new_candidate = next(candidate for candidate in candidates if candidate["id"] == checkpoint["new_candidate_id"])
+    assert new_candidate["status"] == "proposed"
+    assert new_candidate["frontier_member"] is False
 
 
-def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
+def test_run_gepa_optimization_falls_back_when_prompt_model_not_configured(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("DSPY_MODEL", raising=False)
     monkeypatch.delenv("PROMPT_MODEL", raising=False)
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(
@@ -132,8 +138,8 @@ def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
             "job_id": job_id,
             "minibatch_size": 1,
             "selected_rollout_ids": [rollout],
-            "optimizer_backend": "dspy_gepa",
-            "dspy_model": "",
+            "optimizer_backend": "prompt_mutation",
+            "prompt_model": "",
             "openrouter_api_key": "",
         },
     )
@@ -149,3 +155,65 @@ def test_run_gepa_optimization_falls_back_when_dspy_not_configured(
     )
     checkpoint = json.loads((Path(run["artifact_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
     assert checkpoint["optimizer_backend"] == "heuristic_fallback"
+
+
+def test_run_gepa_optimization_uses_frontier_parent_candidate(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="frontier-parent",
+        description="Frontier parent selection check",
+        seed_system_prompt="Seed policy.",
+    )
+    rollout = _create_completed_rollout(
+        store,
+        job_id=job_id,
+        prompt="p1",
+        winner="right",
+        outcome="winner",
+        critique="Refined version has better atmosphere.",
+    )
+    seed_run_id = store.create_run(
+        run_type="gepa",
+        display_name="Existing candidate run",
+        config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
+    )
+    parent_candidate_id = store.create_gepa_candidate(
+        job_id=job_id,
+        parent_candidate_ids=[],
+        candidate_text="Parent policy",
+        compiled_prompt="Frontier parent policy.",
+        objective_scores={"preference_win": 0.8, "feedback_quality": 0.7},
+        created_by_run_id=seed_run_id,
+        status="evaluated",
+    )
+    store.set_candidate_frontier_membership(parent_candidate_id, True)
+    run_id = store.create_run(
+        run_type="gepa",
+        display_name="GEPA frontier-parent run",
+        config={
+            "job_id": job_id,
+            "minibatch_size": 1,
+            "selected_rollout_ids": [rollout],
+            "optimizer_backend": "prompt_mutation",
+            "candidate_selection_seed": 0,
+            "prompt_model": "",
+            "openrouter_api_key": "",
+        },
+    )
+    run = store.get_run(run_id)
+    assert run is not None
+
+    run_gepa_optimization(
+        run_id=run_id,
+        artifact_dir=Path(run["artifact_dir"]),
+        state_store=store,
+        config=json.loads((Path(run["artifact_dir"]) / "config.json").read_text(encoding="utf-8")),
+        append_event=lambda _level, _message: None,
+        is_cancel_requested=lambda: False,
+    )
+
+    checkpoint = json.loads((Path(run["artifact_dir"]) / "checkpoint.json").read_text(encoding="utf-8"))
+    assert checkpoint["parent_candidate_id"] == parent_candidate_id
+    assert checkpoint["compiled_prompt"].startswith("Frontier parent policy.")
+    assert any(item["candidate_id"] == parent_candidate_id for item in checkpoint["frontier_snapshot"])
+    assert not any(item["candidate_id"] == checkpoint["new_candidate_id"] for item in checkpoint["frontier_snapshot"])

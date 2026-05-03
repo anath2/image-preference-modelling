@@ -9,7 +9,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dspy>=3.2.0",
     "gradio>=5.49.1",
     "pyarrow>=24.0.0",
     "python-dotenv>=1.1.1",
@@ -26,9 +25,6 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-filterwarnings = [
-    "ignore:The 'prefix' argument in InputField/OutputField is deprecated and has no effect in DSPy.*:DeprecationWarning",
-]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/image_preference_modelling"]
