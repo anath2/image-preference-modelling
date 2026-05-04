@@ -126,12 +126,3 @@ Run artifacts live under typed subdirectories in `.local/artifacts/`, including:
 - `rating_sessions/`
 
 GEPA mutation runs write `checkpoint.json` with the selected rollouts, parent candidate, new candidate, objective scores, mutation metadata, and frontier snapshot.
-
-## Contributor Guidelines
-
-- Prefer existing storage/UI patterns over new abstractions.
-- Keep behavior job-scoped; aesthetic jobs should not leak candidates or rollouts into one another.
-- Preserve human-authoritative feedback semantics.
-- Treat `.local/`, generated images, and downloaded prompt parquets as runtime data, not source.
-- Mark external-service tests with `@pytest.mark.online`.
-- After editing app behavior, run focused tests such as `tests/test_gradio_app.py`, `tests/test_state_store.py`, `tests/test_gepa_optimizer.py`, or `tests/test_job_launcher.py`.
