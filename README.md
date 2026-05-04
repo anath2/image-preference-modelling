@@ -24,6 +24,12 @@ The configs:
 - Image model: `sourceful/riverflow-v2-fast`
 - Prompt data for sampling: `succinctly/midjourney-prompts`
 
+**Example**
+
+Baseline vs A frontier prompt after a few iterations.
+
+**Prompt**: A low poly portrait of a Salvador Dali in a theater, --ar 4:5
+
 ![Baseline and candidate image comparison](docs/img/example.jpg)
 
 ## Quick Start
