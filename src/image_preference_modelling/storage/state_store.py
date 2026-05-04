@@ -28,7 +28,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -205,6 +205,7 @@ class StateStore:
                 gepa_enable_threshold INTEGER NOT NULL DEFAULT 2,
                 active_candidate_id TEXT,
                 compiled_system_prompt TEXT,
+                seed_candidate_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -296,6 +297,10 @@ class StateStore:
         if current_version == 9:
             self._migrate_v9_to_v10(connection)
             current_version = 10
+
+        if current_version == 10:
+            self._migrate_v10_to_v11(connection)
+            current_version = 11
 
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
@@ -546,6 +551,79 @@ class StateStore:
         if "tie_count" not in candidate_columns:
             connection.execute("ALTER TABLE gepa_candidates ADD COLUMN tie_count INTEGER NOT NULL DEFAULT 0")
         self._set_schema_version(connection, 9)
+
+    def _migrate_v10_to_v11(self, connection: sqlite3.Connection) -> None:
+        aesthetic_job_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(aesthetic_jobs)").fetchall()
+        }
+        if "seed_candidate_id" not in aesthetic_job_columns:
+            connection.execute("ALTER TABLE aesthetic_jobs ADD COLUMN seed_candidate_id TEXT")
+
+        rows = connection.execute(
+            "SELECT id, seed_system_prompt FROM aesthetic_jobs WHERE seed_candidate_id IS NULL"
+        ).fetchall()
+        for row in rows:
+            seed_candidate_id = self._insert_seed_candidate(
+                connection,
+                job_id=str(row[0]),
+                seed_system_prompt=str(row[1] or ""),
+            )
+            connection.execute(
+                "UPDATE aesthetic_jobs SET seed_candidate_id = ? WHERE id = ?",
+                (seed_candidate_id, str(row[0])),
+            )
+
+        self._set_schema_version(connection, 11)
+
+    def _insert_seed_candidate(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        seed_system_prompt: str,
+    ) -> str:
+        candidate_id = f"candidate_{uuid.uuid4().hex[:10]}"
+        cleaned_seed = seed_system_prompt.strip()
+        neutral_scores = {
+            "candidate_win_rate": 0.5,
+            "evaluation_coverage": 0.0,
+            "human_preference": 0.5,
+            "evaluation_confidence": 0.0,
+            "critique_margin": 0.0,
+            "blended_score": 0.5,
+        }
+        connection.execute(
+            """
+            INSERT INTO gepa_candidates(
+                id, job_id, parent_candidate_ids_json, candidate_text,
+                compiled_prompt, objective_scores_json, frontier_member,
+                elo, score, confidence, judge_metadata_json,
+                status, evaluation_count, win_count, loss_count, tie_count,
+                created_by_run_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                candidate_id,
+                job_id,
+                json.dumps([]),
+                cleaned_seed,
+                cleaned_seed,
+                json.dumps(neutral_scores),
+                1,
+                DEFAULT_ELO,
+                0.5,
+                DEFAULT_CONFIDENCE,
+                json.dumps({"is_seed": True}),
+                "evaluated",
+                0,
+                0,
+                0,
+                0,
+                None,
+                _utc_now(),
+            ),
+        )
+        return candidate_id
 
     def _migrate_v9_to_v10(self, connection: sqlite3.Connection) -> None:
         candidate_columns = {
@@ -881,6 +959,16 @@ class StateStore:
                 f"INSERT INTO aesthetic_jobs ({column_list}) VALUES ({placeholders})",
                 tuple(payload[col] for col in insert_columns),
             )
+            seed_candidate_id = self._insert_seed_candidate(
+                connection,
+                job_id=job_id,
+                seed_system_prompt=cleaned_seed,
+            )
+            if "seed_candidate_id" in table_columns:
+                connection.execute(
+                    "UPDATE aesthetic_jobs SET seed_candidate_id = ? WHERE id = ?",
+                    (seed_candidate_id, job_id),
+                )
             connection.commit()
         return job_id
 
@@ -1193,11 +1281,18 @@ class StateStore:
             raise ValueError(f"Unsupported GEPA candidate status: {status}")
         with self._connect() as connection:
             candidate = connection.execute(
-                "SELECT id FROM gepa_candidates WHERE id = ?",
+                "SELECT id, job_id FROM gepa_candidates WHERE id = ?",
                 (candidate_id,),
             ).fetchone()
             if candidate is None:
                 raise ValueError(f"GEPA candidate {candidate_id} does not exist")
+            if status == "archived":
+                seed_row = connection.execute(
+                    "SELECT seed_candidate_id FROM aesthetic_jobs WHERE id = ?",
+                    (candidate["job_id"],),
+                ).fetchone()
+                if seed_row is not None and seed_row["seed_candidate_id"] == candidate_id:
+                    raise ValueError("Cannot archive the seed candidate for an aesthetic job")
             connection.execute(
                 "UPDATE gepa_candidates SET status = ? WHERE id = ?",
                 (status, candidate_id),
