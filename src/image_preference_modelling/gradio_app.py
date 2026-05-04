@@ -81,6 +81,46 @@ def _build_gepa_run_config(
     }
 
 
+def _prompt_candidate_choice_label(candidate: dict[str, Any]) -> str:
+    frontier_marker = "frontier" if candidate["frontier_member"] else "non-frontier"
+    return (
+        f"{candidate['id']} ({candidate['status']}, {frontier_marker}, "
+        f"score={float(candidate.get('score') or 0.0):.3f}, "
+        f"evals={int(candidate.get('evaluation_count') or 0)})"
+    )
+
+
+def _prompt_candidate_metadata(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": candidate["id"],
+        "job_id": candidate["job_id"],
+        "status": candidate["status"],
+        "parent_candidate_ids": candidate["parent_candidate_ids"],
+        "frontier_member": candidate["frontier_member"],
+        "evaluation_count": candidate["evaluation_count"],
+        "win_count": candidate["win_count"],
+        "loss_count": candidate["loss_count"],
+        "tie_count": candidate["tie_count"],
+        "elo": candidate["elo"],
+        "score": candidate["score"],
+        "confidence": candidate["confidence"],
+        "objective_scores": candidate["objective_scores"],
+        "judge_metadata": candidate["judge_metadata"],
+        "created_by_run_id": candidate["created_by_run_id"],
+        "created_at": candidate["created_at"],
+    }
+
+
+def _restored_prompt_candidate_status(candidate: dict[str, Any]) -> str:
+    evidence_count = (
+        int(candidate.get("evaluation_count") or 0)
+        + int(candidate.get("win_count") or 0)
+        + int(candidate.get("loss_count") or 0)
+        + int(candidate.get("tie_count") or 0)
+    )
+    return "evaluated" if evidence_count > 0 else "proposed"
+
+
 def build_app(context: AppContext | None = None) -> gr.Blocks:
     ctx = context or default_context()
     output_dir = _workflow_output_dir()
@@ -199,6 +239,22 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                     lines=14,
                     max_lines=24,
                     value="No mutation logs yet.",
+                )
+                gr.Markdown("## Prompt Pool Explorer")
+                refresh_prompt_pool_btn = gr.Button("Refresh Prompt Pool")
+                prompt_pool_candidate = gr.Dropdown(label="Prompt Mutation", choices=[], value=None)
+                archive_prompt_pool_candidate_btn = gr.Button("Archive / Unarchive Selected Prompt")
+                prompt_pool_prompt = gr.Textbox(
+                    label="Prompt Mutation Compiled Prompt",
+                    interactive=False,
+                    lines=8,
+                    max_lines=18,
+                )
+                prompt_pool_metadata = gr.Textbox(
+                    label="Prompt Mutation Metadata",
+                    interactive=False,
+                    lines=12,
+                    max_lines=24,
                 )
 
             with gr.Tab("Best Candidate Check"):
@@ -511,6 +567,98 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             ]
             return "\n".join(lines), f"Showing logs for `{selected_run}`."
 
+        def _load_prompt_pool_choices(active_job_id: str) -> tuple[gr.Dropdown, str, str, str]:
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return gr.update(choices=[], value=None), "", "", "Select and activate an aesthetic job first."
+            candidates = ctx.state_store.list_gepa_candidates_for_job(selected_job_id)
+            choices = [(_prompt_candidate_choice_label(candidate), candidate["id"]) for candidate in candidates]
+            if not choices:
+                return gr.update(choices=[], value=None), "", "", "No prompt mutations found for selected job."
+            selected_candidate = candidates[0]
+            return (
+                gr.update(choices=choices, value=selected_candidate["id"]),
+                str(selected_candidate["compiled_prompt"]),
+                json.dumps(_prompt_candidate_metadata(selected_candidate), indent=2),
+                f"Loaded {len(choices)} prompt mutation(s).",
+            )
+
+        def _show_prompt_pool_candidate(
+            candidate_id: str | None,
+            active_job_id: str,
+        ) -> tuple[str, str, str]:
+            selected_candidate_id = (candidate_id or "").strip()
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return "", "", "Select and activate an aesthetic job first."
+            if not selected_candidate_id:
+                return "", "", "Select a prompt mutation to inspect."
+            candidates = ctx.state_store.list_gepa_candidates_for_job(selected_job_id)
+            candidate = next(
+                (item for item in candidates if item["id"] == selected_candidate_id),
+                None,
+            )
+            if candidate is None:
+                return "", "", "Selected prompt mutation no longer exists."
+            return (
+                str(candidate["compiled_prompt"]),
+                json.dumps(_prompt_candidate_metadata(candidate), indent=2),
+                f"Showing prompt mutation `{selected_candidate_id}`.",
+            )
+
+        def _archive_or_unarchive_prompt_pool_candidate(
+            candidate_id: str | None,
+            active_job_id: str,
+        ) -> tuple[gr.Dropdown, str, str, str]:
+            selected_candidate_id = (candidate_id or "").strip()
+            selected_job_id = active_job_id.strip()
+            if not selected_job_id:
+                return gr.update(), "", "", "Select and activate an aesthetic job first."
+            if not selected_candidate_id:
+                return gr.update(), "", "", "Select a prompt mutation to archive or unarchive."
+            job = ctx.state_store.get_aesthetic_job(selected_job_id)
+            if job is None:
+                return gr.update(), "", "", "Selected job is unavailable."
+            candidates = ctx.state_store.list_gepa_candidates_for_job(selected_job_id)
+            candidate = next(
+                (item for item in candidates if item["id"] == selected_candidate_id),
+                None,
+            )
+            if candidate is None:
+                return gr.update(), "", "", "Selected prompt mutation no longer exists."
+            if (
+                candidate["status"] != "archived"
+                and selected_candidate_id == str(job.get("active_candidate_id") or "")
+            ):
+                return (
+                    gr.update(),
+                    str(candidate["compiled_prompt"]),
+                    json.dumps(_prompt_candidate_metadata(candidate), indent=2),
+                    "Cannot archive the active promoted prompt. Promote another prompt first.",
+                )
+
+            next_status = (
+                _restored_prompt_candidate_status(candidate)
+                if candidate["status"] == "archived"
+                else "archived"
+            )
+            ctx.state_store.update_gepa_candidate_status(selected_candidate_id, next_status)
+            refreshed_candidates = ctx.state_store.list_gepa_candidates_for_job(selected_job_id)
+            refreshed_candidate = next(
+                item for item in refreshed_candidates if item["id"] == selected_candidate_id
+            )
+            choices = [
+                (_prompt_candidate_choice_label(candidate_item), candidate_item["id"])
+                for candidate_item in refreshed_candidates
+            ]
+            verb = "Unarchived" if next_status != "archived" else "Archived"
+            return (
+                gr.update(choices=choices, value=selected_candidate_id),
+                str(refreshed_candidate["compiled_prompt"]),
+                json.dumps(_prompt_candidate_metadata(refreshed_candidate), indent=2),
+                f"{verb} prompt mutation `{selected_candidate_id}`.",
+            )
+
         def _promote_best_frontier_candidate(active_job_id: str) -> tuple[str, str, str, str]:
             selected_job_id = active_job_id.strip()
             if not selected_job_id:
@@ -603,18 +751,44 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             evaluating = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["evaluating"])
             evaluated = ctx.state_store.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
             frontier = [candidate for candidate in evaluated if candidate["frontier_member"]]
+            seed_candidate_id = str(job.get("seed_candidate_id") or "").strip()
             pending = proposed or evaluating
             if pending:
                 right = random.choice(pending)
                 left_pool = [candidate for candidate in frontier if candidate["id"] != right["id"]]
                 if not left_pool:
                     left_pool = [candidate for candidate in evaluated if candidate["id"] != right["id"]]
+                if not left_pool:
+                    left_pool = [
+                        candidate
+                        for candidate in (*proposed, *evaluating)
+                        if candidate["id"] != right["id"]
+                    ]
                 left = random.choice(left_pool) if left_pool else None
                 return {
                     "rollout_type": "candidate_comparison" if left is not None else "baseline_candidate",
                     "left_candidate_id": None if left is None else str(left["id"]),
                     "right_candidate_id": str(right["id"]),
                     "left_prompt": "" if left is None else str(left["compiled_prompt"]),
+                    "right_prompt": str(right["compiled_prompt"]),
+                }
+
+            non_seed_evaluated = [
+                candidate for candidate in evaluated if str(candidate["id"]) != seed_candidate_id
+            ]
+            if non_seed_evaluated:
+                right = random.choice(non_seed_evaluated)
+                seed_candidate = next(
+                    (candidate for candidate in evaluated if str(candidate["id"]) == seed_candidate_id),
+                    None,
+                )
+                return {
+                    "rollout_type": "candidate_comparison",
+                    "left_candidate_id": seed_candidate_id or None,
+                    "right_candidate_id": str(right["id"]),
+                    "left_prompt": (
+                        str(seed_candidate["compiled_prompt"]) if seed_candidate is not None else ""
+                    ),
                     "right_prompt": str(right["compiled_prompt"]),
                 }
 
@@ -878,18 +1052,16 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 generation_mode="text_only",
                 model_config={"image_model": settings.image_model},
             )
-            selected_right_candidate_id = right_candidate_id.strip()
-            if selected_right_candidate_id:
-                right_candidate = next(
-                    (
-                        candidate
-                        for candidate in ctx.state_store.list_gepa_candidates_for_job(active_job_id.strip())
-                        if candidate["id"] == selected_right_candidate_id
-                    ),
+            job_candidates = ctx.state_store.list_gepa_candidates_for_job(active_job_id.strip())
+            for side_candidate_id in (right_candidate_id.strip(), left_candidate_id.strip()):
+                if not side_candidate_id:
+                    continue
+                side_candidate = next(
+                    (candidate for candidate in job_candidates if candidate["id"] == side_candidate_id),
                     None,
                 )
-                if right_candidate is not None and right_candidate["status"] == "proposed":
-                    ctx.state_store.update_gepa_candidate_status(selected_right_candidate_id, "evaluating")
+                if side_candidate is not None and side_candidate["status"] == "proposed":
+                    ctx.state_store.update_gepa_candidate_status(side_candidate_id, "evaluating")
             return (
                 str(baseline_path),
                 str(candidate_path),
@@ -1274,6 +1446,21 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
             _show_gepa_logs,
             inputs=[latest_gepa_run_id_state],
             outputs=[gepa_run_logs, workflow_status],
+        )
+        refresh_prompt_pool_btn.click(
+            _load_prompt_pool_choices,
+            inputs=[active_job_id_state],
+            outputs=[prompt_pool_candidate, prompt_pool_prompt, prompt_pool_metadata, workflow_status],
+        )
+        prompt_pool_candidate.change(
+            _show_prompt_pool_candidate,
+            inputs=[prompt_pool_candidate, active_job_id_state],
+            outputs=[prompt_pool_prompt, prompt_pool_metadata, workflow_status],
+        )
+        archive_prompt_pool_candidate_btn.click(
+            _archive_or_unarchive_prompt_pool_candidate,
+            inputs=[prompt_pool_candidate, active_job_id_state],
+            outputs=[prompt_pool_candidate, prompt_pool_prompt, prompt_pool_metadata, workflow_status],
         )
         gepa_poll_timer.tick(
             _refresh_gepa_status,
