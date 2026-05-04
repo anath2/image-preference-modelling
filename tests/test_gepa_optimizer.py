@@ -187,6 +187,9 @@ def test_run_gepa_optimization_uses_frontier_parent_candidate(tmp_path: Path) ->
         status="evaluated",
     )
     store.set_candidate_frontier_membership(parent_candidate_id, True)
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    store.set_candidate_frontier_membership(str(job["seed_candidate_id"]), False)
     run_id = store.create_run(
         run_type="gepa",
         display_name="GEPA frontier-parent run",

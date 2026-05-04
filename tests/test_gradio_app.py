@@ -7,6 +7,7 @@ from image_preference_modelling.app_context import AppContext
 from image_preference_modelling.gradio_app import (
     _build_gepa_run_config,
     _resolve_active_system_prompt,
+    _restored_prompt_candidate_status,
     _winner_to_storage_outcome,
     build_app,
 )
@@ -58,6 +59,8 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Promote Best Frontier Candidate" in buttons
     assert "Refresh Mutation Status" in buttons
     assert "Show Mutation Logs" in buttons
+    assert "Refresh Prompt Pool" in buttons
+    assert "Archive / Unarchive Selected Prompt" in buttons
     assert "Generate Best Candidate Check" in buttons
     assert "Active Job" in labels
     assert "Selected Job Name" in labels
@@ -70,6 +73,9 @@ def test_build_app_exposes_single_flow_controls(tmp_path: Path) -> None:
     assert "Mutation Feedback Batch Size" in labels
     assert "Latest Mutation Run Status" in labels
     assert "Mutation Run Logs" in labels
+    assert "Prompt Mutation" in labels
+    assert "Prompt Mutation Compiled Prompt" in labels
+    assert "Prompt Mutation Metadata" in labels
     assert "Best Candidate Check Prompt" in labels
     assert "Best Check Baseline System Prompt" in labels
     assert "Best Check Candidate System Prompt" in labels
@@ -123,6 +129,21 @@ def test_build_gepa_run_config_includes_job_and_minibatch() -> None:
     assert config["minibatch_size"] == 3
     assert config["selected_rollout_ids"] == ["rollout_1", "rollout_2", "rollout_3"]
     assert config["optimizer_backend"] == "prompt_mutation"
+
+
+def test_restored_prompt_candidate_status_uses_evaluation_evidence() -> None:
+    assert (
+        _restored_prompt_candidate_status(
+            {"evaluation_count": 0, "win_count": 0, "loss_count": 0, "tie_count": 0}
+        )
+        == "proposed"
+    )
+    assert (
+        _restored_prompt_candidate_status(
+            {"evaluation_count": 1, "win_count": 0, "loss_count": 0, "tie_count": 0}
+        )
+        == "evaluated"
+    )
 
 
 def test_resolve_active_system_prompt_prefers_compiled_prompt() -> None:

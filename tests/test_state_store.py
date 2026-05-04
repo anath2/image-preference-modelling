@@ -191,7 +191,7 @@ def test_schema_version_and_migration_from_v1(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 10
+    assert store.schema_version() == 11
 
     session = store.get_rating_session("session_legacy")
     assert session is not None
@@ -330,12 +330,21 @@ def test_migrate_v4_rollouts_adds_text_only_columns(tmp_path: Path) -> None:
         connection.commit()
 
     store = StateStore(db_path=db_path, artifact_root=artifact_root)
-    assert store.schema_version() == 10
+    assert store.schema_version() == 11
 
     job = store.get_aesthetic_job("job_legacy")
     assert job is not None
     assert job["seed_system_prompt"] == "legacy seed"
     assert job["compiled_system_prompt"] == "legacy compiled"
+    assert job["seed_candidate_id"]
+    seed_candidates = [
+        candidate
+        for candidate in store.list_gepa_candidates_for_job("job_legacy", statuses=["evaluated"])
+        if candidate["id"] == job["seed_candidate_id"]
+    ]
+    assert len(seed_candidates) == 1
+    assert seed_candidates[0]["compiled_prompt"] == "legacy seed"
+    assert seed_candidates[0]["frontier_member"] is True
 
     with sqlite3.connect(db_path) as connection:
         row = connection.execute(
@@ -502,7 +511,7 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
         objective_scores={"preference_win": 0.8, "feedback_quality": 0.9},
         created_by_run_id=run_id,
     )
-    candidates = store.list_gepa_candidates_for_job(job_id)
+    candidates = store.list_gepa_candidates_for_job(job_id, statuses=["proposed"])
     assert len(candidates) == 1
     assert candidates[0]["id"] == candidate_id
     assert candidates[0]["parent_candidate_ids"] == []
@@ -523,9 +532,13 @@ def test_gepa_candidate_creation_listing_and_promotion(tmp_path: Path) -> None:
 
     store.update_gepa_candidate_status(candidate_id, "evaluated")
     store.set_candidate_frontier_membership(candidate_id, True)
-    updated_candidates = store.list_gepa_candidates_for_job(job_id)
-    assert updated_candidates[0]["frontier_member"] is True
-    assert updated_candidates[0]["status"] == "evaluated"
+    updated = next(
+        candidate
+        for candidate in store.list_gepa_candidates_for_job(job_id)
+        if candidate["id"] == candidate_id
+    )
+    assert updated["frontier_member"] is True
+    assert updated["status"] == "evaluated"
 
     store.promote_job_candidate(job_id, candidate_id)
     job = store.get_aesthetic_job(job_id)
@@ -877,3 +890,49 @@ def test_list_rollouts_for_job_returns_metadata_and_feedback(tmp_path: Path) -> 
     assert item["winner"] == "right"
     assert item["outcome"] == "winner"
     assert item["model_config"]["image_model"] == "test"
+
+
+def test_create_aesthetic_job_plants_seed_candidate(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="seeded-job",
+        description="job that should auto-plant a seed candidate",
+        seed_system_prompt="Preserve composition and improve lighting.",
+    )
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    seed_candidate_id = job["seed_candidate_id"]
+    assert seed_candidate_id
+
+    candidates = store.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
+    assert len(candidates) == 1
+    seed = candidates[0]
+    assert seed["id"] == seed_candidate_id
+    assert seed["status"] == "evaluated"
+    assert seed["frontier_member"] is True
+    assert seed["compiled_prompt"] == "Preserve composition and improve lighting."
+    assert seed["evaluation_count"] == 0
+    assert seed["objective_scores"]["candidate_win_rate"] == 0.5
+    assert seed["judge_metadata"].get("is_seed") is True
+
+
+def test_seed_candidate_cannot_be_archived(tmp_path: Path) -> None:
+    store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
+    job_id = store.create_aesthetic_job(
+        name="seeded-job",
+        description="archive protection",
+        seed_system_prompt="Seed prompt.",
+    )
+    job = store.get_aesthetic_job(job_id)
+    assert job is not None
+    seed_candidate_id = str(job["seed_candidate_id"])
+
+    with pytest.raises(ValueError, match="seed candidate"):
+        store.update_gepa_candidate_status(seed_candidate_id, "archived")
+
+    seed = next(
+        candidate
+        for candidate in store.list_gepa_candidates_for_job(job_id)
+        if candidate["id"] == seed_candidate_id
+    )
+    assert seed["status"] == "evaluated"
