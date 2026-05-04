@@ -592,13 +592,13 @@ def test_candidate_feedback_stats_update_lifecycle_counts(tmp_path: Path) -> Non
     assert candidates[winner_id]["elo"] > 1000.0
     assert candidates[winner_id]["score"] > candidates[loser_id]["score"]
     assert candidates[winner_id]["confidence"] == pytest.approx(0.16)
-    assert candidates[winner_id]["objective_scores"]["candidate_win_rate"] == 1.0
-    assert candidates[winner_id]["objective_scores"]["evaluation_coverage"] == 0.2
+    assert candidates[winner_id]["objective_scores"]["win_rate"] == 1.0
+    assert candidates[winner_id]["objective_scores"]["evaluation_count"] == 1.0
     assert candidates[loser_id]["status"] == "evaluated"
     assert candidates[loser_id]["evaluation_count"] == 1
     assert candidates[loser_id]["loss_count"] == 1
     assert candidates[loser_id]["elo"] < 1000.0
-    assert candidates[loser_id]["objective_scores"]["candidate_win_rate"] == 0.0
+    assert candidates[loser_id]["objective_scores"]["win_rate"] == 0.0
 
 
 def test_archive_pending_gepa_candidates_for_job_only_archives_pending(tmp_path: Path) -> None:
@@ -687,16 +687,16 @@ def test_best_training_candidate_allows_limited_evidence_for_sanity_check(tmp_pa
     assert selected["confidence"] < 0.5
 
 
-def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> None:
+def test_recompute_gepa_contender_pool_favors_preference_leaders(tmp_path: Path) -> None:
     store = StateStore(db_path=tmp_path / "state.db", artifact_root=tmp_path / "artifacts")
     job_id = store.create_aesthetic_job(
-        name="frontier",
-        description="frontier checks",
+        name="contender-pool",
+        description="contender pool checks",
         seed_system_prompt="seed",
     )
     run_id = store.create_run(
         run_type="gepa",
-        display_name="GEPA frontier run",
+        display_name="GEPA contender run",
         config={"job_id": job_id, "minibatch_size": 1, "selected_rollout_ids": []},
     )
     weak_candidate = store.create_gepa_candidate(
@@ -704,7 +704,7 @@ def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> N
         parent_candidate_ids=[],
         candidate_text="weak",
         compiled_prompt="weak",
-        objective_scores={"preference_win": 0.2, "feedback_quality": 0.2},
+        objective_scores={},
         created_by_run_id=run_id,
         status="evaluated",
     )
@@ -713,10 +713,17 @@ def test_recompute_gepa_frontier_marks_dominated_candidates(tmp_path: Path) -> N
         parent_candidate_ids=[],
         candidate_text="strong",
         compiled_prompt="strong",
-        objective_scores={"preference_win": 0.8, "feedback_quality": 0.8},
+        objective_scores={},
         created_by_run_id=run_id,
         status="evaluated",
     )
+    for _ in range(8):
+        store.update_candidate_feedback_stats(
+            winner_candidate_id=strong_candidate,
+            loser_candidate_id=weak_candidate,
+            winner_margin=0.95,
+            critique_confidence=0.85,
+        )
 
     snapshot = store.recompute_gepa_frontier_for_job(job_id)
     membership = {item["candidate_id"]: item["frontier_member"] for item in snapshot}
@@ -912,7 +919,8 @@ def test_create_aesthetic_job_plants_seed_candidate(tmp_path: Path) -> None:
     assert seed["frontier_member"] is True
     assert seed["compiled_prompt"] == "Preserve composition and improve lighting."
     assert seed["evaluation_count"] == 0
-    assert seed["objective_scores"]["candidate_win_rate"] == 0.5
+    assert seed["objective_scores"]["preference_score"] == pytest.approx(0.5)
+    assert seed["objective_scores"]["win_rate"] == 0.5
     assert seed["judge_metadata"].get("is_seed") is True
 
 

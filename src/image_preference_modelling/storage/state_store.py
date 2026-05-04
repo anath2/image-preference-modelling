@@ -11,9 +11,9 @@ from image_preference_modelling.gepa.reward import (
     DEFAULT_CONFIDENCE,
     DEFAULT_ELO,
     DEFAULT_SCORE,
-    blended_candidate_score,
     confidence_from_evidence,
     pairwise_elo_update,
+    preference_score_from_elo,
 )
 from image_preference_modelling.storage.contracts import (
     RatingOutcome,
@@ -28,7 +28,30 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _is_seed_candidate_row(judge_meta: dict[str, Any]) -> bool:
+    return bool((judge_meta or {}).get("is_seed"))
+
+
+def _candidate_preference_rank_from_dict(candidate_row: dict[str, Any]) -> float:
+    """Preference rank used for contender pool; aligns with persisted `score` column when set."""
+    os_map = candidate_row.get("objective_scores") or {}
+    raw_score = candidate_row.get("score")
+    if raw_score is not None:
+        return float(raw_score)
+    if "preference_score" in os_map:
+        return float(os_map["preference_score"])
+    if "blended_score" in os_map:
+        return float(os_map["blended_score"])
+    return preference_score_from_elo(float(candidate_row.get("elo") or DEFAULT_ELO))
+
+
 SCHEMA_VERSION = 11
+
+# Candidate "frontier_member" marks the contender pool: near-best preference_rank (Elo-derived)
+# after sufficient head-to-head evidence, plus all seed prompts. Not a multi-objective Pareto frontier.
+CONTEST_POOL_MIN_EVALUATIONS = 2
+CONTEST_SCORE_TOLERANCE = 0.05
+
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 VALID_RUN_STATUSES = {"queued", "running", *TERMINAL_RUN_STATUSES}
 VALID_RUN_TYPES = {"generation", "reward_model", "gepa", "evaluation"}
@@ -585,12 +608,11 @@ class StateStore:
         candidate_id = f"candidate_{uuid.uuid4().hex[:10]}"
         cleaned_seed = seed_system_prompt.strip()
         neutral_scores = {
-            "candidate_win_rate": 0.5,
-            "evaluation_coverage": 0.0,
-            "human_preference": 0.5,
-            "evaluation_confidence": 0.0,
-            "critique_margin": 0.0,
-            "blended_score": 0.5,
+            "preference_score": preference_score_from_elo(DEFAULT_ELO),
+            "preference_confidence": float(DEFAULT_CONFIDENCE),
+            "win_rate": 0.5,
+            "evaluation_count": 0.0,
+            "average_critique_margin": 0.0,
         }
         connection.execute(
             """
@@ -1416,23 +1438,18 @@ class StateStore:
                     evaluation_count=evaluation_count,
                     average_critique_confidence=avg_confidence,
                 )
-                blended_score = blended_candidate_score(
-                    elo=elo,
-                    confidence=confidence,
-                    average_margin_quality=avg_margin,
-                )
+                preference_rank = preference_score_from_elo(elo)
                 win_rate = (
                     (float(win_count) + 0.5 * float(tie_count)) / float(evaluation_count)
                     if evaluation_count
                     else 0.0
                 )
                 scores = {
-                    "candidate_win_rate": win_rate,
-                    "evaluation_coverage": min(1.0, float(evaluation_count) / 5.0),
-                    "human_preference": win_rate,
-                    "evaluation_confidence": confidence,
-                    "critique_margin": avg_margin,
-                    "blended_score": blended_score,
+                    "preference_score": preference_rank,
+                    "preference_confidence": confidence,
+                    "win_rate": win_rate,
+                    "evaluation_count": float(evaluation_count),
+                    "average_critique_margin": avg_margin,
                 }
                 connection.execute(
                     """
@@ -1440,7 +1457,7 @@ class StateStore:
                     SET objective_scores_json = ?, score = ?, confidence = ?, judge_metadata_json = ?
                     WHERE id = ?
                     """,
-                    (json.dumps(scores), blended_score, confidence, json.dumps(judge_summary), candidate_id),
+                    (json.dumps(scores), preference_rank, confidence, json.dumps(judge_summary), candidate_id),
                 )
             connection.commit()
 
@@ -1467,32 +1484,56 @@ class StateStore:
         return summary
 
     def recompute_gepa_frontier_for_job(self, job_id: str) -> list[dict[str, Any]]:
-        candidates = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
-
-        def dominates(a: dict[str, float], b: dict[str, float]) -> bool:
-            keys = set(a) | set(b)
-            return (
-                all(float(a.get(key, 0.0)) >= float(b.get(key, 0.0)) for key in keys)
-                and any(float(a.get(key, 0.0)) > float(b.get(key, 0.0)) for key in keys)
-            )
-
+        evaluated = self.list_gepa_candidates_for_job(job_id, statuses=["evaluated"])
         frontier_ids: set[str] = set()
-        for candidate in candidates:
-            candidate_scores = candidate["objective_scores"]
-            is_dominated = any(
-                other["id"] != candidate["id"]
-                and dominates(other["objective_scores"], candidate_scores)
-                for other in candidates
-            )
-            if not is_dominated:
-                frontier_ids.add(str(candidate["id"]))
+
+        non_seed_evidence_pool = [
+            cand
+            for cand in evaluated
+            if not _is_seed_candidate_row(cand.get("judge_metadata") or {})
+            and int(cand.get("evaluation_count") or 0) >= CONTEST_POOL_MIN_EVALUATIONS
+        ]
+
+        def add_seed_frontier() -> None:
+            for cand in evaluated:
+                if _is_seed_candidate_row(cand.get("judge_metadata") or {}):
+                    frontier_ids.add(str(cand["id"]))
+
+        if non_seed_evidence_pool:
+            reference_best = max(_candidate_preference_rank_from_dict(c) for c in non_seed_evidence_pool)
+            add_seed_frontier()
+            for cand in evaluated:
+                if _is_seed_candidate_row(cand.get("judge_metadata") or {}):
+                    continue
+                ec = int(cand.get("evaluation_count") or 0)
+                rank = _candidate_preference_rank_from_dict(cand)
+                if ec >= CONTEST_POOL_MIN_EVALUATIONS:
+                    if rank >= reference_best - CONTEST_SCORE_TOLERANCE:
+                        frontier_ids.add(str(cand["id"]))
+        else:
+            tentative = [
+                cand
+                for cand in evaluated
+                if not _is_seed_candidate_row(cand.get("judge_metadata") or {})
+                and int(cand.get("evaluation_count") or 0) >= 1
+            ]
+            add_seed_frontier()
+            if tentative:
+                provisional_best = max(_candidate_preference_rank_from_dict(c) for c in tentative)
+                for cand in evaluated:
+                    if _is_seed_candidate_row(cand.get("judge_metadata") or {}):
+                        continue
+                    ec = int(cand.get("evaluation_count") or 0)
+                    rank = _candidate_preference_rank_from_dict(cand)
+                    if ec >= 1 and rank >= provisional_best - CONTEST_SCORE_TOLERANCE:
+                        frontier_ids.add(str(cand["id"]))
 
         with self._connect() as connection:
             connection.execute(
                 "UPDATE gepa_candidates SET frontier_member = 0 WHERE job_id = ?",
                 (job_id,),
             )
-            for candidate in candidates:
+            for candidate in evaluated:
                 connection.execute(
                     "UPDATE gepa_candidates SET frontier_member = ? WHERE id = ?",
                     (1 if candidate["id"] in frontier_ids else 0, candidate["id"]),
@@ -1501,7 +1542,7 @@ class StateStore:
 
         return [
             {"candidate_id": candidate["id"], "frontier_member": candidate["id"] in frontier_ids}
-            for candidate in candidates
+            for candidate in evaluated
         ]
 
     def promote_job_candidate(self, job_id: str, candidate_id: str) -> None:
@@ -1523,7 +1564,7 @@ class StateStore:
             if candidate["status"] != "evaluated":
                 raise ValueError("Cannot promote a GEPA candidate before it is evaluated")
             if not bool(candidate["frontier_member"]):
-                raise ValueError("Cannot promote a GEPA candidate that is not on the frontier")
+                raise ValueError("Cannot promote a GEPA candidate that is not in the contender pool")
             job_row = connection.execute(
                 "SELECT latest_system_prompt FROM aesthetic_jobs WHERE id = ?",
                 (job_id,),
@@ -1555,12 +1596,18 @@ class StateStore:
             if candidate["frontier_member"]
         ]
         if not candidates:
-            raise ValueError(f"Aesthetic job {job_id} has no evaluated frontier candidates")
+            raise ValueError(f"Aesthetic job {job_id} has no evaluated contenders")
 
         def ranking_key(candidate: dict[str, Any]) -> tuple[float, int, str]:
-            scores = candidate["objective_scores"]
+            os_map = candidate["objective_scores"]
+            raw = candidate.get("score")
+            primary = (
+                float(raw)
+                if raw is not None
+                else float(os_map.get("preference_score") or os_map.get("blended_score") or 0.0)
+            )
             return (
-                float(candidate.get("score") or scores.get("blended_score", 0.0)),
+                primary,
                 int(candidate.get("evaluation_count") or 0),
                 str(candidate["created_at"]),
             )

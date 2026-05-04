@@ -82,7 +82,7 @@ def _build_gepa_run_config(
 
 
 def _prompt_candidate_choice_label(candidate: dict[str, Any]) -> str:
-    frontier_marker = "frontier" if candidate["frontier_member"] else "non-frontier"
+    frontier_marker = "contender" if candidate["frontier_member"] else "non-contender"
     return (
         f"{candidate['id']} ({candidate['status']}, {frontier_marker}, "
         f"score={float(candidate.get('score') or 0.0):.3f}, "
@@ -224,7 +224,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 )
                 run_gepa_btn = gr.Button("Generate Mutation Now")
                 archive_pending_candidates_btn = gr.Button("Archive Pending Candidates")
-                promote_frontier_btn = gr.Button("Promote Best Frontier Candidate")
+                promote_frontier_btn = gr.Button("Promote Best Contender")
                 refresh_gepa_status_btn = gr.Button("Refresh Mutation Status")
                 show_gepa_logs_btn = gr.Button("Show Mutation Logs")
                 gepa_poll_timer = gr.Timer(value=2.0, active=False)
@@ -674,7 +674,7 @@ def build_app(context: AppContext | None = None) -> gr.Blocks:
                 str(job.get("latest_system_prompt") or ""),
                 "",
                 "",
-                f"Promoted frontier candidate `{candidate_id}`.",
+                f"Promoted contender candidate `{candidate_id}`.",
             )
 
         def _refresh_inspector_jobs() -> tuple[gr.Dropdown, str]:

@@ -8,15 +8,15 @@ The current control plane is a Gradio app called the **Gradio Operator Cockpit**
 
 This project tests how far text-only guidance can steer a "blind" image model without fine-tuning image weights. Image preference is subjective, so human comparisons are the source of truth. LLMs help with guided prompt sampling, critique interpretation, and reflective prompt mutation, but they do not decide which image won.
 
-The loop is inspired by **Genetic-Pareto** prompt evolution: an LLM reflects on rollout critiques to propose mutations, while a Pareto-style frontier lets multiple winning aesthetic strategies coexist instead of collapsing into a single global best.
+The loop is inspired by **Genetic-Pareto**–style exploration: an LLM reflects on rollout critiques to propose mutations, while a **contender pool** keeps several near-best prompts in play instead of collapsing to a single global best (this is preference-rank proximity to the leader plus seeds, not a multi-objective Pareto frontier over redundant metrics).
 
 1. Sample or type a prompt.
 2. Generate a no-system baseline and a candidate image using a saved system prompt.
 3. Submit `left`, `right`, or `no_clear_winner` plus a critique.
 4. Use the critique judge to estimate update strength and confidence without overriding the human.
-5. Update candidate Elo, blended score, confidence, and frontier membership.
+5. Update candidate Elo, preference score (normalized from Elo), evidence confidence, and contender-pool membership.
 6. Generate a new prompt mutation once enough new feedback accumulates.
-7. Sanity-check and explicitly promote evaluated frontier candidates.
+7. Sanity-check and explicitly promote from evaluated contenders.
 
 The configs:
 
@@ -54,7 +54,7 @@ The package lives in `src/image_preference_modelling/`.
 - `storage/contracts.py` defines shared run/status types and artifact directory helpers.
 - `gepa/scoring.py` converts completed rollout feedback into objective signals.
 - `gepa/critique_judge.py` asks the prompt model to estimate preference margin and critique usefulness.
-- `gepa/reward.py` implements Elo, confidence, and blended candidate score helpers.
+- `gepa/reward.py` implements Elo updates, normalized preference score (`preference_score_from_elo`), and evidence confidence helpers.
 - `gepa/mutation_engine.py` generates prompt mutations, with a heuristic fallback when model settings are unavailable.
 - `gepa/optimizer.py` is the real `gepa` run worker: it scores selected feedback, chooses a parent candidate, creates a proposed mutation, and writes `checkpoint.json`.
 - `jobs/job_launcher.py` dispatches background runs through a small thread pool. `gepa` is wired to real work; other run types still use the simulation stub.
@@ -66,7 +66,7 @@ The cockpit is organized into tabs:
 
 - **Jobs** creates, selects, updates, and archives aesthetic jobs. Each job has a seed prompt and a seed candidate in the prompt pool.
 - **Train / Compare** samples prompts, prepares candidate matchups, generates left/right images, and records feedback.
-- **Prompt Evolution** runs mutations, shows mutation logs, promotes the best frontier candidate, and includes a Prompt Pool Explorer for inspecting, archiving, and unarchiving prompt candidates.
+- **Prompt Evolution** runs mutations, shows mutation logs, promotes the best contender, and includes a Prompt Pool Explorer for inspecting, archiving, and unarchiving prompt candidates.
 - **Best Candidate Check** compares the best evaluated training candidate against a no-system baseline for a typed prompt. This is a sanity check, not promotion.
 - **Rollout Inspector** shows saved rollout metadata and image paths.
 
@@ -75,7 +75,7 @@ Important semantics:
 - Human feedback controls the winner. The critique judge never flips the human outcome.
 - The winner control is intentionally three-way: `left`, `right`, or `no_clear_winner`.
 - Candidate statuses are `proposed`, `evaluating`, `evaluated`, and `archived`.
-- Promotion requires an evaluated frontier candidate.
+- Promotion requires an evaluated contender (seed prompts always count as contenders; others need enough head-to-head evidence and preference rank near the job leader).
 - Archived candidates remain inspectable but are excluded from normal pending/evaluated selection.
 - Do not reintroduce `dspy` for this loop; the current design is a handrolled, human-guided mutation/evaluation loop for subjective preference.
 

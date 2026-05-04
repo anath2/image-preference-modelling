@@ -28,6 +28,17 @@ def normalize_elo(elo: float, *, floor: float = 800.0, ceiling: float = 1200.0) 
     return clamp01((float(elo) - floor) / (ceiling - floor))
 
 
+def preference_score_from_elo(
+    elo: float, *, floor: float = 800.0, ceiling: float = 1200.0
+) -> float:
+    """Scalar preference rank mapped to [0, 1] from Elo (no confidence or critique mixing).
+
+    Confidence and critique-derived signals belong in preference_confidence /
+    diagnostics, not duplicated into this scalar.
+    """
+    return normalize_elo(elo, floor=floor, ceiling=ceiling)
+
+
 def confidence_from_evidence(
     *,
     evaluation_count: int,
@@ -38,19 +49,6 @@ def confidence_from_evidence(
         raise ValueError("target_evaluations must be >= 1")
     coverage = min(1.0, max(0, int(evaluation_count)) / float(target_evaluations))
     return coverage * clamp01(average_critique_confidence)
-
-
-def blended_candidate_score(
-    *,
-    elo: float,
-    confidence: float,
-    average_margin_quality: float,
-) -> float:
-    return clamp01(
-        0.75 * normalize_elo(elo)
-        + 0.15 * clamp01(average_margin_quality)
-        + 0.10 * clamp01(confidence)
-    )
 
 
 def pairwise_elo_update(

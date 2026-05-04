@@ -1,7 +1,9 @@
+import pytest
+
 from image_preference_modelling.gepa.reward import (
-    blended_candidate_score,
     confidence_from_evidence,
     pairwise_elo_update,
+    preference_score_from_elo,
 )
 
 
@@ -33,10 +35,10 @@ def test_pairwise_elo_update_no_clear_winner_is_neutral() -> None:
     assert update.right_result == 0.5
 
 
-def test_confidence_and_blended_score_are_bounded() -> None:
+def test_confidence_and_preference_score_are_bounded() -> None:
     confidence = confidence_from_evidence(evaluation_count=3, average_critique_confidence=0.8)
-    score = blended_candidate_score(elo=1100.0, confidence=confidence, average_margin_quality=0.7)
+    pref = preference_score_from_elo(1100.0)
 
-    assert confidence == 0.48
-    assert 0.0 <= score <= 1.0
-    assert score > 0.5
+    assert confidence == pytest.approx(0.48)
+    assert 0.0 <= pref <= 1.0
+    assert pref == pytest.approx(0.75)
