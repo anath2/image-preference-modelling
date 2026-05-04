@@ -18,18 +18,13 @@ The loop is inspired by **Genetic-Pareto** prompt evolution: an LLM reflects on 
 6. Generate a new prompt mutation once enough new feedback accumulates.
 7. Sanity-check and explicitly promote evaluated frontier candidates.
 
-The initial portrait experiments used:
+The configs:
 
 - Prompt model: `deepseek-v4-flash`
 - Image model: `sourceful/riverflow-v2-fast`
-- Prompt data: `succinctly/midjourney-prompts`
-- Task focus: portrait aesthetics
+- Prompt data for sampling: `succinctly/midjourney-prompts`
 
 ![Baseline and candidate image comparison](docs/img/example.jpg)
-
-Known limitations: some visual preferences are hard to express precisely in words, and building a useful candidate pool is slow because each rollout needs baseline and candidate generation plus human feedback. A future direction is bootstrapping with a learned binary human preference model, then reserving richer textual feedback for selected examples.
-
-See `docs/write-up.md` for the narrative writeup and example before/after images. See `docs/architecture.md` for the current flowchart and runtime architecture.
 
 ## Quick Start
 
@@ -41,19 +36,6 @@ uv run gradio-cockpit
 ```
 
 The app stores local runtime state under `.local/`, downloaded prompt sources under `data/prompt_sources/`, and generated job images under `data/jobs/`.
-
-## Environment
-
-Environment variables are loaded from `.env` with `python-dotenv` and do not override already-exported values.
-
-| Variable | Purpose |
-|---|---|
-| `OPENROUTER_API_KEY` | Required for OpenRouter model calls |
-| `IMAGE_MODEL` | OpenRouter image-generation model ID |
-| `PROMPT_MODEL` | OpenRouter model ID for prompt selection, critique judging, and prompt mutation |
-| `OPENROUTER_BASE_URL` | Optional; defaults to `https://openrouter.ai/api/v1` |
-
-If these are missing, offline/unit tests still work, but app actions that call real models will fail with explicit configuration errors.
 
 ## Contributor Map
 
